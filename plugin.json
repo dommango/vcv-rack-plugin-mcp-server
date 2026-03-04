@@ -1,0 +1,24 @@
+{
+  "slug": "VCVRackMcpServer",
+  "name": "VCV Rack MCP Server",
+  "version": "2.0.0",
+  "license": "MIT",
+  "brand": "VCV Rack MCP Server",
+  "author": "Claudio",
+  "authorEmail": "",
+  "authorUrl": "https://github.com/YOUR_USERNAME",
+  "pluginUrl": "https://github.com/YOUR_USERNAME/vcv-rack-mcp-server",
+  "manualUrl": "https://github.com/YOUR_USERNAME/vcv-rack-mcp-server/blob/main/README.md",
+  "sourceUrl": "https://github.com/YOUR_USERNAME/vcv-rack-mcp-server",
+  "donateUrl": "",
+  "changelogUrl": "https://github.com/YOUR_USERNAME/vcv-rack-mcp-server/blob/main/CHANGELOG.md",
+  "minRackVersion": "2.0.0",
+  "modules": [
+    {
+      "slug": "RackMcpServer",
+      "name": "Rack MCP Server",
+      "description": "Embedded HTTP server exposing VCV Rack internals to AI clients (Claude, Cursor, etc.) via the Model Context Protocol. Enables AI to build patches, add modules, connect cables, and tweak parameters.",
+      "tags": ["Utility", "External"]
+    }
+  ]
+}
