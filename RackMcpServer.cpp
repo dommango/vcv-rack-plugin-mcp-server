@@ -343,7 +343,7 @@ static const char* MCP_TOOLS_JSON = R"json([
 {"name":"vcvrack_get_status","description":"Get VCV Rack server status: version, sample rate, and loaded module count.","inputSchema":{"type":"object","properties":{}}},
 {"name":"vcvrack_list_modules","description":"List all modules currently loaded in the VCV Rack patch with their IDs, slugs, and port counts.","inputSchema":{"type":"object","properties":{}}},
 {"name":"vcvrack_get_module","description":"Get detailed information about a specific module: all parameters (with value ranges), inputs, and outputs.","inputSchema":{"type":"object","properties":{"id":{"type":"integer","description":"Module ID"}},"required":["id"]}},
-{"name":"vcvrack_add_module","description":"Add a new module to the VCV Rack patch. Use vcvrack_search_library to discover valid plugin/slug values.","inputSchema":{"type":"object","properties":{"plugin":{"type":"string","description":"Plugin slug (e.g. 'Fundamental')"},"slug":{"type":"string","description":"Module slug (e.g. 'VCO-1')"},"x":{"type":"number","description":"X position in pixels (optional, auto-placed after rightmost module if omitted)"},"y":{"type":"number","description":"Y position in pixels (optional)"}},"required":["plugin","slug"]}},
+{"name":"vcvrack_add_module","description":"Add a new module to the VCV Rack patch. Modules are auto-positioned to the right of the MCP bridge module by default. Use nearModuleId to place a module next to a specific related module (e.g. place a VCF right next to a VCO). Use vcvrack_search_library to discover valid plugin/slug values.","inputSchema":{"type":"object","properties":{"plugin":{"type":"string","description":"Plugin slug (e.g. 'Fundamental')"},"slug":{"type":"string","description":"Module slug (e.g. 'VCO-1')"},"nearModuleId":{"type":"integer","description":"Optional: ID of an existing module to place this new module next to (immediately to its right). Use this to keep related modules together."},"x":{"type":"number","description":"X position in pixels (optional, overrides auto-placement)"},"y":{"type":"number","description":"Y position in pixels (optional, used only when x is also provided)"}},"required":["plugin","slug"]}},
 {"name":"vcvrack_delete_module","description":"Delete a module from the VCV Rack patch by ID.","inputSchema":{"type":"object","properties":{"id":{"type":"integer","description":"Module ID to delete"}},"required":["id"]}},
 {"name":"vcvrack_get_params","description":"Get all parameters of a module with names, value ranges, and current values.","inputSchema":{"type":"object","properties":{"moduleId":{"type":"integer","description":"Module ID"}},"required":["moduleId"]}},
 {"name":"vcvrack_set_params","description":"Set one or more parameters on a module. Call vcvrack_get_params first to discover parameter IDs and valid value ranges.","inputSchema":{"type":"object","properties":{"moduleId":{"type":"integer","description":"Module ID"},"params":{"type":"array","description":"Array of parameter updates","items":{"type":"object","properties":{"id":{"type":"integer","description":"Parameter index (0-based)"},"value":{"type":"number","description":"New parameter value"}},"required":["id","value"]}}},"required":["moduleId","params"]}},
@@ -505,6 +505,43 @@ public:
     RackHttpServer() : port(2600) {}
     ~RackHttpServer() { stop(); }
 
+    // ─── Smart module positioning ────────────────────────────────────────────
+    // Must be called from the UI thread (inside a taskQueue lambda).
+    // Returns the position where a new module should be placed.
+    //   nearModuleId >= 0  → place immediately to the right of that module
+    //   nearModuleId  < 0  → place to the right of the rightmost module in the
+    //                         same horizontal row as the MCP bridge module.
+    math::Vec computeAutoPosition(int64_t nearModuleId = -1) {
+        if (!rackApp || !rackApp->scene || !rackApp->scene->rack) return math::Vec(0, 0);
+        app::RackWidget* rw = rackApp->scene->rack;
+
+        // ── Place near a specific "friend" module ───────────────────────────
+        if (nearModuleId >= 0) {
+            app::ModuleWidget* fw = rw->getModule(nearModuleId);
+            if (fw) return math::Vec(fw->box.pos.x + fw->box.size.x, fw->box.pos.y);
+        }
+
+        // ── Default: anchor to the MCP bridge module ────────────────────────
+        app::ModuleWidget* bridge = parent ? rw->getModule(parent->id) : nullptr;
+        float anchorX = bridge ? (bridge->box.pos.x + bridge->box.size.x) : 0.f;
+        float anchorY = bridge ? bridge->box.pos.y : 0.f;
+        float rowHalfH = bridge ? (bridge->box.size.y * 0.6f) : 380.f;
+
+        // Find the rightmost module in the same row (vertically close to bridge)
+        float bestX = anchorX;
+        float bestY = anchorY;
+        for (app::ModuleWidget* w : rw->getModules()) {
+            if (bridge && w == bridge) continue;
+            float wCenterY = w->box.pos.y + w->box.size.y * 0.5f;
+            float anchorCenterY = anchorY + (bridge ? bridge->box.size.y * 0.5f : rowHalfH);
+            if (std::abs(wCenterY - anchorCenterY) < rowHalfH) {
+                float r = w->box.pos.x + w->box.size.x;
+                if (r > bestX) { bestX = r; bestY = w->box.pos.y; }
+            }
+        }
+        return math::Vec(bestX, bestY);
+    }
+
     // ─── MCP tool dispatcher ────────────────────────────────────────────────
 
     std::string dispatchTool(const std::string& name, const std::string& args) {
@@ -555,7 +592,8 @@ public:
             std::string pSlug = parseJsonString(args, "plugin");
             std::string mSlug = parseJsonString(args, "slug");
             float x = (float)parseJsonDouble(args, "x", -1.0);
-            float y = (float)parseJsonDouble(args, "y", 0.0);
+            float y = (float)parseJsonDouble(args, "y", -1.0);
+            int64_t nearId = (int64_t)parseJsonDouble(args, "nearModuleId", -1.0);
             plugin::Model* model = nullptr;
             for (plugin::Plugin* p : rack::plugin::plugins)
                 if (p->slug == pSlug)
@@ -563,7 +601,7 @@ public:
                         if (m->slug == mSlug) { model = m; break; }
             if (!model) return toolFail("Model not found: " + pSlug + "/" + mSlug);
             int64_t moduleId = -1;
-            taskQueue->post([rackApp, model, x, y, &moduleId]() mutable {
+            taskQueue->post([this, rackApp, model, x, y, nearId, &moduleId]() mutable {
                 if (!rackApp->engine || !rackApp->scene || !rackApp->scene->rack) return;
                 engine::Module* m = model->createModule();
                 if (!m) return;
@@ -572,15 +610,13 @@ public:
                 app::ModuleWidget* mw = model->createModuleWidget(m);
                 if (!mw) return;
                 rackApp->scene->rack->addModule(mw);
-                float px = x, py = y;
-                if (px < 0.f) {
-                    px = 0.f; bool found = false;
-                    for (app::ModuleWidget* w : rackApp->scene->rack->getModules()) {
-                        float r = w->box.pos.x + w->box.size.x;
-                        if (!found || r > px) { px = r; py = w->box.pos.y; found = true; }
-                    }
+                math::Vec pos;
+                if (x >= 0.f) {
+                    pos = math::Vec(x, y >= 0.f ? y : 0.f);
+                } else {
+                    pos = computeAutoPosition(nearId);
                 }
-                rackApp->scene->rack->setModulePosForce(mw, math::Vec(px, py));
+                rackApp->scene->rack->setModulePosForce(mw, pos);
             }).get();
             if (moduleId < 0) return toolFail("Failed to create module");
             return toolOk("{\"id\":" + std::to_string(moduleId) +
@@ -919,26 +955,25 @@ public:
         svr.Post("/modules/add", [rackApp, this](const httplib::Request& req, httplib::Response& res) {
             if (!rackApp || !rackApp->engine || !rackApp->scene || !rackApp->scene->rack) { res.status = 503; res.set_content(err("Engine not available"), "application/json"); return; }
             std::string pSlug = parseJsonString(req.body, "plugin"), mSlug = parseJsonString(req.body, "slug");
-            float x = (float)parseJsonDouble(req.body, "x", -1.0), y = (float)parseJsonDouble(req.body, "y", 0.0);
+            float x = (float)parseJsonDouble(req.body, "x", -1.0), y = (float)parseJsonDouble(req.body, "y", -1.0);
+            int64_t nearId = (int64_t)parseJsonDouble(req.body, "nearModuleId", -1.0);
             plugin::Model* model = nullptr;
             for (plugin::Plugin* p : rack::plugin::plugins) if (p->slug == pSlug) for (plugin::Model* m : p->models) if (m->slug == mSlug) { model = m; break; }
             if (!model) { res.status = 404; res.set_content(err("Model not found"), "application/json"); return; }
             int64_t moduleId = -1;
-            taskQueue->post([rackApp, model, x, y, &moduleId]() mutable {
+            taskQueue->post([this, rackApp, model, x, y, nearId, &moduleId]() mutable {
                 if (!rackApp->engine || !rackApp->scene || !rackApp->scene->rack) return;
                 engine::Module* m = model->createModule(); if (!m) return;
                 rackApp->engine->addModule(m); moduleId = m->id;
                 app::ModuleWidget* mw = model->createModuleWidget(m); if (!mw) return;
                 rackApp->scene->rack->addModule(mw);
-                float px = x, py = y;
-                if (px < 0.f) {
-                    px = 0.f; bool found = false;
-                    for (app::ModuleWidget* w : rackApp->scene->rack->getModules()) {
-                        float r = w->box.pos.x + w->box.size.x;
-                        if (!found || r > px) { px = r; py = w->box.pos.y; found = true; }
-                    }
+                math::Vec pos;
+                if (x >= 0.f) {
+                    pos = math::Vec(x, y >= 0.f ? y : 0.f);
+                } else {
+                    pos = computeAutoPosition(nearId);
                 }
-                rackApp->scene->rack->setModulePosForce(mw, math::Vec(px, py));
+                rackApp->scene->rack->setModulePosForce(mw, pos);
             }).get();
             if (moduleId < 0) { res.status = 500; res.set_content(err("Failed to create module"), "application/json"); }
             else res.set_content(ok("{" + jsonKV("id", std::to_string(moduleId)) + jsonKVs("plugin", pSlug) + jsonKVs("slug", mSlug, true) + "}"), "application/json");
