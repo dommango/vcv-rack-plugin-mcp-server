@@ -3,7 +3,7 @@
  * VCV Rack 2 Plugin — MCP HTTP Bridge
  */
 
-#include "plugin.hpp"
+#include "RackMcpServer.hpp"
 
 // cpp-httplib (header-only)
 #define CPPHTTPLIB_OPENSSL_SUPPORT 0
@@ -16,48 +16,35 @@
 #include <patch.hpp>
 #include <tag.hpp>
 
-#include <thread>
-#include <atomic>
-#include <mutex>
-#include <queue>
-#include <future>
 #include <sstream>
 #include <cstring>
 
 using namespace rack;
 
-struct RackMcpServer;
-class RackHttpServer;
-
 // ─── UI Task Queue ─────────────────────────────────────────────────────────
 
-struct UITaskQueue {
-    std::mutex mutex;
-    std::queue<std::pair<std::function<void()>, std::shared_ptr<std::promise<void>>>> tasks;
-
-    std::future<void> post(std::function<void()> fn) {
-        auto p = std::make_shared<std::promise<void>>();
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            tasks.push({fn, p});
-        }
-        return p->get_future();
+std::future<void> UITaskQueue::post(std::function<void()> fn) {
+    auto p = std::make_shared<std::promise<void>>();
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        tasks.push({fn, p});
     }
+    return p->get_future();
+}
 
-    void drain() {
-        std::queue<std::pair<std::function<void()>, std::shared_ptr<std::promise<void>>>> local;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            std::swap(local, tasks);
-        }
-        while (!local.empty()) {
-            auto& [fn, p] = local.front();
-            try { fn(); p->set_value(); }
-            catch (...) { p->set_exception(std::current_exception()); }
-            local.pop();
-        }
+void UITaskQueue::drain() {
+    std::queue<std::pair<std::function<void()>, std::shared_ptr<std::promise<void>>>> local;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::swap(local, tasks);
     }
-};
+    while (!local.empty()) {
+        auto& [fn, p] = local.front();
+        try { fn(); p->set_value(); }
+        catch (...) { p->set_exception(std::current_exception()); }
+        local.pop();
+    }
+}
 
 // ─── tiny JSON builder helpers ─────────────────────────────────────────────
 
@@ -448,106 +435,71 @@ static std::string buildPromptMessages(const std::string& name, const std::strin
 
 // ─── Module Definition ─────────────────────────────────────────────────────
 
-struct RackMcpServer : Module {
-    enum ParamIds { PORT_PARAM, ENABLED_PARAM, NUM_PARAMS };
-    enum InputIds { NUM_INPUTS };
-    enum OutputIds { HEARTBEAT_OUTPUT, NUM_OUTPUTS };
-    enum LightIds { RUNNING_LIGHT, NUM_LIGHTS };
+RackMcpServer::RackMcpServer() {
+    config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
+    configParam(PORT_PARAM, 2000.f, 9999.f, 2600.f, "HTTP Port")->snapEnabled = true;
+    configParam(ENABLED_PARAM, 0.f, 1.f, 0.f, "Enable HTTP Server");
+    configOutput(HEARTBEAT_OUTPUT, "Server heartbeat");
+}
 
-    UITaskQueue taskQueue;
-    RackHttpServer* server = nullptr;
-    bool wasEnabled = false;
-    float heartbeatPhase = 0.f;
+void RackMcpServer::process(const ProcessArgs& args) {
+    bool enabled = params[ENABLED_PARAM].getValue() > 0.5f;
+    if (enabled && !wasEnabled) startServer((int)params[PORT_PARAM].getValue());
+    else if (!enabled && wasEnabled) stopServer();
+    wasEnabled = enabled;
+    if (server) {
+        heartbeatPhase += args.sampleTime;
+        if (heartbeatPhase >= 1.f) heartbeatPhase -= 1.f;
+        outputs[HEARTBEAT_OUTPUT].setVoltage(heartbeatPhase < 0.05f ? 10.f : 0.f);
+    }
+}
 
-    std::mutex pendingDeleteMutex;
-    std::vector<uint64_t> pendingDeleteIds;
+json_t* RackMcpServer::dataToJson() {
+    json_t* rootJ = json_object();
+    json_object_set_new(rootJ, "enabled", json_boolean(wasEnabled));
+    return rootJ;
+}
 
-    RackMcpServer() {
-        config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
-        configParam(PORT_PARAM, 2000.f, 9999.f, 2600.f, "HTTP Port")->snapEnabled = true;
-        configParam(ENABLED_PARAM, 0.f, 1.f, 0.f, "Enable HTTP Server");
-        configOutput(HEARTBEAT_OUTPUT, "Server heartbeat");
-    }
-    ~RackMcpServer();
-    void startServer(int port);
-    void stopServer();
-    void process(const ProcessArgs& args) override {
-        bool enabled = params[ENABLED_PARAM].getValue() > 0.5f;
-        if (enabled && !wasEnabled) startServer((int)params[PORT_PARAM].getValue());
-        else if (!enabled && wasEnabled) stopServer();
-        wasEnabled = enabled;
-        if (server) {
-            heartbeatPhase += args.sampleTime;
-            if (heartbeatPhase >= 1.f) heartbeatPhase -= 1.f;
-            outputs[HEARTBEAT_OUTPUT].setVoltage(heartbeatPhase < 0.05f ? 10.f : 0.f);
-        }
-    }
-    json_t* dataToJson() override {
-        json_t* rootJ = json_object();
-        json_object_set_new(rootJ, "enabled", json_boolean(wasEnabled));
-        return rootJ;
-    }
-    void dataFromJson(json_t* rootJ) override {
-        json_t* enabledJ = json_object_get(rootJ, "enabled");
-        if (enabledJ) params[ENABLED_PARAM].setValue(json_boolean_value(enabledJ) ? 1.f : 0.f);
-    }
-};
+void RackMcpServer::dataFromJson(json_t* rootJ) {
+    json_t* enabledJ = json_object_get(rootJ, "enabled");
+    if (enabledJ) params[ENABLED_PARAM].setValue(json_boolean_value(enabledJ) ? 1.f : 0.f);
+}
 
 // ─── HTTP Server ───────────────────────────────────────────────────────────
 
-class RackHttpServer {
-public:
-    httplib::Server svr;
-    std::thread serverThread;
-    std::atomic<bool> running{false};
-    int port;
-    UITaskQueue* taskQueue = nullptr;
-    RackMcpServer* parent = nullptr;
-    rack::Context* rackApp = nullptr; // captured at setup time when engine is valid
+RackHttpServer::~RackHttpServer() { stop(); }
 
-    RackHttpServer() : port(2600) {}
-    ~RackHttpServer() { stop(); }
+rack::math::Vec RackHttpServer::computeAutoPosition(int64_t nearModuleId) {
+    if (!rackApp || !rackApp->scene || !rackApp->scene->rack) return math::Vec(0, 0);
+    app::RackWidget* rw = rackApp->scene->rack;
 
-    // ─── Smart module positioning ────────────────────────────────────────────
-    // Must be called from the UI thread (inside a taskQueue lambda).
-    // Returns the position where a new module should be placed.
-    //   nearModuleId >= 0  → place immediately to the right of that module
-    //   nearModuleId  < 0  → place to the right of the rightmost module in the
-    //                         same horizontal row as the MCP bridge module.
-    math::Vec computeAutoPosition(int64_t nearModuleId = -1) {
-        if (!rackApp || !rackApp->scene || !rackApp->scene->rack) return math::Vec(0, 0);
-        app::RackWidget* rw = rackApp->scene->rack;
-
-        // ── Place near a specific "friend" module ───────────────────────────
-        if (nearModuleId >= 0) {
-            app::ModuleWidget* fw = rw->getModule(nearModuleId);
-            if (fw) return math::Vec(fw->box.pos.x + fw->box.size.x, fw->box.pos.y);
-        }
-
-        // ── Default: anchor to the MCP bridge module ────────────────────────
-        app::ModuleWidget* bridge = parent ? rw->getModule(parent->id) : nullptr;
-        float anchorX = bridge ? (bridge->box.pos.x + bridge->box.size.x) : 0.f;
-        float anchorY = bridge ? bridge->box.pos.y : 0.f;
-        float rowHalfH = bridge ? (bridge->box.size.y * 0.6f) : 380.f;
-
-        // Find the rightmost module in the same row (vertically close to bridge)
-        float bestX = anchorX;
-        float bestY = anchorY;
-        for (app::ModuleWidget* w : rw->getModules()) {
-            if (bridge && w == bridge) continue;
-            float wCenterY = w->box.pos.y + w->box.size.y * 0.5f;
-            float anchorCenterY = anchorY + (bridge ? bridge->box.size.y * 0.5f : rowHalfH);
-            if (std::abs(wCenterY - anchorCenterY) < rowHalfH) {
-                float r = w->box.pos.x + w->box.size.x;
-                if (r > bestX) { bestX = r; bestY = w->box.pos.y; }
-            }
-        }
-        return math::Vec(bestX, bestY);
+    if (nearModuleId >= 0) {
+        app::ModuleWidget* fw = rw->getModule(nearModuleId);
+        if (fw) return math::Vec(fw->box.pos.x + fw->box.size.x, fw->box.pos.y);
     }
 
-    // ─── MCP tool dispatcher ────────────────────────────────────────────────
+    app::ModuleWidget* bridge = parent ? rw->getModule(parent->id) : nullptr;
+    float anchorX = bridge ? (bridge->box.pos.x + bridge->box.size.x) : 0.f;
+    float anchorY = bridge ? bridge->box.pos.y : 0.f;
+    float rowHalfH = bridge ? (bridge->box.size.y * 0.6f) : 380.f;
 
-    std::string dispatchTool(const std::string& name, const std::string& args) {
+    float bestX = anchorX;
+    float bestY = anchorY;
+    for (app::ModuleWidget* w : rw->getModules()) {
+        if (bridge && w == bridge) continue;
+        float wCenterY = w->box.pos.y + w->box.size.y * 0.5f;
+        float anchorCenterY = anchorY + (bridge ? bridge->box.size.y * 0.5f : rowHalfH);
+        if (std::abs(wCenterY - anchorCenterY) < rowHalfH) {
+            float r = w->box.pos.x + w->box.size.x;
+            if (r > bestX) { bestX = r; bestY = w->box.pos.y; }
+        }
+    }
+    return math::Vec(bestX, bestY);
+}
+
+// ─── MCP tool dispatcher ────────────────────────────────────────────────
+
+std::string RackHttpServer::dispatchTool(const std::string& name, const std::string& args) {
         auto* rackApp = this->rackApp;
 
         if (name == "vcvrack_get_status") {
@@ -826,11 +778,11 @@ public:
         }
 
         return toolFail("Unknown tool: " + name);
-    }
+}
 
-    // ─── MCP Streamable HTTP request handler ────────────────────────────────
+// ─── MCP Streamable HTTP request handler ────────────────────────────────
 
-    void handleMcpPost(const httplib::Request& req, httplib::Response& res) {
+void RackHttpServer::handleMcpPost(const httplib::Request& req, httplib::Response& res) {
         const std::string& body = req.body;
         std::string id     = parseJsonRpcId(body);
         std::string method = parseJsonString(body, "method");
@@ -898,9 +850,9 @@ public:
         }
 
         res.set_content(mcpErr(id, -32601, "Method not found: " + method), "application/json");
-    }
+}
 
-    void setupRoutes() {
+void RackHttpServer::setupRoutes() {
         rackApp = APP;
         auto* rackApp = this->rackApp; // local alias for lambda captures
         svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
@@ -1203,11 +1155,25 @@ public:
             res.body   = ": VCV Rack MCP Bridge\n\n";
             res.status = 200;
         });
-    }
+}
 
-    void start() { setupRoutes(); running = true; serverThread = std::thread([this]() { INFO("[RackMcpServer] Port %d", port); svr.listen("127.0.0.1", port); running = false; }); }
-    void stop() { if (running) { svr.stop(); if (serverThread.joinable()) serverThread.join(); running = false; } }
-};
+void RackHttpServer::start() {
+    setupRoutes();
+    running = true;
+    serverThread = std::thread([this]() {
+        INFO("[RackMcpServer] Port %d", port);
+        svr.listen("127.0.0.1", port);
+        running = false;
+    });
+}
+
+void RackHttpServer::stop() {
+    if (running) {
+        svr.stop();
+        if (serverThread.joinable()) serverThread.join();
+        running = false;
+    }
+}
 
 RackMcpServer::~RackMcpServer() { stopServer(); }
 void RackMcpServer::startServer(int port) { stopServer(); server = new RackHttpServer(); server->port = port; server->taskQueue = &taskQueue; server->parent = this; server->start(); lights[RUNNING_LIGHT].setBrightness(1.f); }
@@ -1215,99 +1181,89 @@ void RackMcpServer::stopServer() { if (server) { server->stop(); delete server; 
 
 // ─── Port text field ──────────────────────────────────────────────────────
 
-struct PortTextField : LedDisplayTextField {
-    RackMcpServer* module = nullptr;
-    PortTextField() {
-        multiline = false;
-        color = nvgRGB(0x7d, 0xec, 0xc2);
-        bgColor = nvgRGB(0x14, 0x1d, 0x33);
-        textOffset = Vec(5.f, 0.f);
+PortTextField::PortTextField() {
+    multiline = false;
+    color = nvgRGB(0x7d, 0xec, 0xc2);
+    bgColor = nvgRGB(0x14, 0x1d, 0x33);
+    textOffset = Vec(5.f, 0.f);
+}
+
+void PortTextField::step() {
+    LedDisplayTextField::step();
+    if (!module) return;
+    if (APP->event->getSelectedWidget() != this) {
+        int p = (int)module->params[RackMcpServer::PORT_PARAM].getValue();
+        std::string s = std::to_string(p);
+        if (text != s) setText(s);
     }
-    void step() override {
-        LedDisplayTextField::step();
-        if (!module) return;
-        // Sync from param only when not being edited
-        if (APP->event->getSelectedWidget() != this) {
-            int p = (int)module->params[RackMcpServer::PORT_PARAM].getValue();
-            std::string s = std::to_string(p); if (text != s) setText(s);
-        }
+}
+
+void PortTextField::onSelectKey(const SelectKeyEvent& e) {
+    LedDisplayTextField::onSelectKey(e);
+    if (module && e.action == GLFW_PRESS && (e.key == GLFW_KEY_ENTER || e.key == GLFW_KEY_KP_ENTER)) {
+        module->params[RackMcpServer::PORT_PARAM].setValue((float)std::atoi(text.c_str()));
+        APP->event->setSelectedWidget(nullptr);
     }
-    void onSelectKey(const SelectKeyEvent& e) override {
-        LedDisplayTextField::onSelectKey(e);
-        if (module && e.action == GLFW_PRESS && (e.key == GLFW_KEY_ENTER || e.key == GLFW_KEY_KP_ENTER)) {
-            module->params[RackMcpServer::PORT_PARAM].setValue((float)std::atoi(text.c_str()));
-            APP->event->setSelectedWidget(nullptr);
-        }
-    }
-};
+}
 
-struct PanelLabelWidget : TransparentWidget {
-    void drawLabel(const DrawArgs& args, float x, float y, std::string txt, float fontSize, NVGcolor col, int align = NVG_ALIGN_CENTER) {
-        nvgFontFaceId(args.vg, APP->window->uiFont->handle);
-        nvgFontSize(args.vg, fontSize);
-        nvgTextLetterSpacing(args.vg, 0.3f);
-        nvgTextAlign(args.vg, align | NVG_ALIGN_MIDDLE);
-        nvgFillColor(args.vg, col);
-        nvgText(args.vg, x, y, txt.c_str(), NULL);
-    }
+void PanelLabelWidget::drawLabel(const DrawArgs& args, float x, float y, std::string txt, float fontSize, NVGcolor col, int align) {
+    nvgFontFaceId(args.vg, APP->window->uiFont->handle);
+    nvgFontSize(args.vg, fontSize);
+    nvgTextLetterSpacing(args.vg, 0.3f);
+    nvgTextAlign(args.vg, align | NVG_ALIGN_MIDDLE);
+    nvgFillColor(args.vg, col);
+    nvgText(args.vg, x, y, txt.c_str(), NULL);
+}
 
-    void drawDivider(const DrawArgs& args, float y) {
-        nvgBeginPath(args.vg);
-        nvgMoveTo(args.vg, mm2px(4.5f), y);
-        nvgLineTo(args.vg, box.size.x - mm2px(4.5f), y);
-        nvgStrokeWidth(args.vg, 1.0f);
-        nvgStrokeColor(args.vg, nvgRGBA(0x9a, 0xa8, 0xc9, 70));
-        nvgStroke(args.vg);
-    }
+void PanelLabelWidget::drawDivider(const DrawArgs& args, float y) {
+    nvgBeginPath(args.vg);
+    nvgMoveTo(args.vg, mm2px(4.5f), y);
+    nvgLineTo(args.vg, box.size.x - mm2px(4.5f), y);
+    nvgStrokeWidth(args.vg, 1.0f);
+    nvgStrokeColor(args.vg, nvgRGBA(0x9a, 0xa8, 0xc9, 70));
+    nvgStroke(args.vg);
+}
 
-    void drawCard(const DrawArgs& args, float xMm, float yMm, float wMm, float hMm) {
-        Rect r = Rect(mm2px(Vec(xMm, yMm)), mm2px(Vec(wMm, hMm)));
-        nvgBeginPath(args.vg);
-        nvgRoundedRect(args.vg, r.pos.x, r.pos.y, r.size.x, r.size.y, 7.f);
-        nvgFillColor(args.vg, nvgRGBA(0x13, 0x1a, 0x2d, 150));
-        nvgFill(args.vg);
-        nvgStrokeWidth(args.vg, 1.2f);
-        nvgStrokeColor(args.vg, nvgRGBA(0x84, 0x95, 0xbb, 90));
-        nvgStroke(args.vg);
-    }
+void PanelLabelWidget::drawCard(const DrawArgs& args, float xMm, float yMm, float wMm, float hMm) {
+    Rect r = Rect(mm2px(Vec(xMm, yMm)), mm2px(Vec(wMm, hMm)));
+    nvgBeginPath(args.vg);
+    nvgRoundedRect(args.vg, r.pos.x, r.pos.y, r.size.x, r.size.y, 7.f);
+    nvgFillColor(args.vg, nvgRGBA(0x13, 0x1a, 0x2d, 150));
+    nvgFill(args.vg);
+    nvgStrokeWidth(args.vg, 1.2f);
+    nvgStrokeColor(args.vg, nvgRGBA(0x84, 0x95, 0xbb, 90));
+    nvgStroke(args.vg);
+}
 
-    void draw(const DrawArgs& args) override {
-        const float cx = box.size.x / 2.f;
-        const float left = mm2px(6.5f);
-        NVGcolor title = nvgRGB(0xef, 0xf3, 0xff);
-        NVGcolor label = nvgRGB(0xaa, 0xb5, 0xd3);
+void PanelLabelWidget::draw(const DrawArgs& args) {
+    const float cx = box.size.x / 2.f;
+    const float left = mm2px(6.5f);
+    NVGcolor title = nvgRGB(0xef, 0xf3, 0xff);
+    NVGcolor label = nvgRGB(0xaa, 0xb5, 0xd3);
 
-        drawLabel(args, cx, mm2px(12.f), "MCP SERVER", 11.0f, title);
-        drawLabel(args, cx, mm2px(19.f), "local bridge", 6.0f, nvgRGBA(0xc0, 0xcb, 0xe8, 140));
+    drawLabel(args, cx, mm2px(12.f), "MCP SERVER", 11.0f, title);
+    drawLabel(args, cx, mm2px(19.f), "local bridge", 6.0f, nvgRGBA(0xc0, 0xcb, 0xe8, 140));
 
-        drawDivider(args, mm2px(27.f));
+    drawDivider(args, mm2px(27.f));
+    drawLabel(args, left, mm2px(36.f), "PORT", 7.2f, label, NVG_ALIGN_LEFT);
+    drawCard(args, 4.8f, 39.f, 20.9f, 12.0f);
 
-        drawLabel(args, left, mm2px(36.f), "PORT", 7.2f, label, NVG_ALIGN_LEFT);
-        drawCard(args, 4.8f, 39.f, 20.9f, 12.0f);
+    drawDivider(args, mm2px(57.f));
+    drawLabel(args, left, mm2px(62.f), "POWER", 7.2f, label, NVG_ALIGN_LEFT);
+    drawCard(args, 4.8f, 65.f, 20.9f, 12.5f);
 
-        drawDivider(args, mm2px(57.f));
+    drawDivider(args, mm2px(81.f));
+    drawLabel(args, left, mm2px(79.f), "STATUS", 7.2f, label, NVG_ALIGN_LEFT);
+    drawCard(args, 4.8f, 82.f, 20.9f, 12.5f);
 
-        drawLabel(args, left, mm2px(62.f), "POWER", 7.2f, label, NVG_ALIGN_LEFT);
-        drawCard(args, 4.8f, 65.f, 20.9f, 12.5f);
-
-        drawDivider(args, mm2px(81.f));
-
-        drawLabel(args, left, mm2px(79.f), "STATUS", 7.2f, label, NVG_ALIGN_LEFT);
-        drawCard(args, 4.8f, 82.f, 20.9f, 12.5f);
-
-        drawDivider(args, mm2px(100.f));
-
-        drawLabel(args, left, mm2px(102.f), "CLOCK", 7.2f, label, NVG_ALIGN_LEFT);
-        drawCard(args, 4.8f, 105.f, 20.9f, 14.5f);
-    }
-};
+    drawDivider(args, mm2px(100.f));
+    drawLabel(args, left, mm2px(102.f), "CLOCK", 7.2f, label, NVG_ALIGN_LEFT);
+    drawCard(args, 4.8f, 105.f, 20.9f, 14.5f);
+}
 
 // ─── Widget ───────────────────────────────────────────────────────────────
 
-struct RackMcpServerWidget : ModuleWidget {
-    PortTextField* portField = nullptr;
-
-    RackMcpServerWidget(RackMcpServer* module) {
+RackMcpServerWidget::RackMcpServerWidget(RackMcpServer* module) {
         setModule(module);
         setPanel(createPanel(asset::plugin(pluginInstance, "res/RackMcpServer.svg")));
 
@@ -1342,34 +1298,31 @@ struct RackMcpServerWidget : ModuleWidget {
         // Heartbeat output
         addOutput(createOutputCentered<PJ301MPort>(
             mm2px(Vec(15.24, 108.f)), module, RackMcpServer::HEARTBEAT_OUTPUT));
-    }
+}
 
-    void step() override {
-        ModuleWidget::step();
-        RackMcpServer* m = getModule<RackMcpServer>();
-        if (!m) return;
-        {
-            std::vector<uint64_t> toDelete;
-            { std::lock_guard<std::mutex> lock(m->pendingDeleteMutex); std::swap(toDelete, m->pendingDeleteIds); }
-            for (uint64_t id : toDelete) {
-                engine::Module* mod = APP->engine->getModule(id);
-                if (mod) {
-                    app::ModuleWidget* mw = APP->scene->rack->getModule(mod->id);
-                    if (mw) {
-                        // High-level safe deletion via selection action
-                        APP->scene->rack->deselectAll();
-                        APP->scene->rack->select(mw);
-                        APP->scene->rack->deleteSelectionAction();
-                    } else {
-                        // Fallback: remove from engine if no widget exists
-                        APP->engine->removeModule(mod);
-                        delete mod;
-                    }
+void RackMcpServerWidget::step() {
+    ModuleWidget::step();
+    RackMcpServer* m = getModule<RackMcpServer>();
+    if (!m) return;
+    {
+        std::vector<uint64_t> toDelete;
+        { std::lock_guard<std::mutex> lock(m->pendingDeleteMutex); std::swap(toDelete, m->pendingDeleteIds); }
+        for (uint64_t id : toDelete) {
+            engine::Module* mod = APP->engine->getModule(id);
+            if (mod) {
+                app::ModuleWidget* mw = APP->scene->rack->getModule(mod->id);
+                if (mw) {
+                    APP->scene->rack->deselectAll();
+                    APP->scene->rack->select(mw);
+                    APP->scene->rack->deleteSelectionAction();
+                } else {
+                    APP->engine->removeModule(mod);
+                    delete mod;
                 }
             }
         }
-        m->taskQueue.drain();
     }
-};
+    m->taskQueue.drain();
+}
 
 Model* modelRackMcpServer = createModel<RackMcpServer, RackMcpServerWidget>("RackMcpServer");

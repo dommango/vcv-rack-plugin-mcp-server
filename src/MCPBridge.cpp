@@ -31,7 +31,7 @@
  *  GET  /sample-rate         — get engine sample rate
  */
 
-#include "plugin.hpp"
+#include "MCPBridge.hpp"
 
 // cpp-httplib (header-only, auto-downloaded by `make dep` or CMake FetchContent).
 // Disable OpenSSL — plain HTTP is fine for localhost-only use.
@@ -43,9 +43,6 @@
 #include <app/RackWidget.hpp>
 #include <app/ModuleWidget.hpp>
 
-#include <thread>
-#include <atomic>
-#include <mutex>
 #include <sstream>
 #include <cstring>
 
@@ -239,16 +236,9 @@ static double parseJsonDouble(const std::string& json, const std::string& key, d
 
 // ─── HTTP Server wrapper ───────────────────────────────────────────────────
 
-class RackHttpServer {
-public:
-    httplib::Server svr;
-    std::thread     serverThread;
-    std::atomic<bool> running{false};
-    int             port;
+RackHttpServer::~RackHttpServer() { stop(); }
 
-    RackHttpServer() : port(2600) {}
-
-    void setupRoutes() {
+void RackHttpServer::setupRoutes() {
 
         // ── CORS / JSON content-type middleware ──────────────────────────
         svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
@@ -580,116 +570,90 @@ public:
             APP->patch->load(path);
             res.set_content(ok("{" + jsonKVs("loaded", path, true) + "}"), "application/json");
         });
-    }
+}
 
-    void start() {
-        setupRoutes();
-        running = true;
-        serverThread = std::thread([this]() {
-            INFO("[MCPBridge] HTTP server starting on port %d", port);
-            svr.listen("127.0.0.1", port);
-            INFO("[MCPBridge] HTTP server stopped");
-        });
-    }
+void RackHttpServer::start() {
+    setupRoutes();
+    running = true;
+    serverThread = std::thread([this]() {
+        INFO("[MCPBridge] HTTP server starting on port %d", port);
+        svr.listen("127.0.0.1", port);
+        INFO("[MCPBridge] HTTP server stopped");
+    });
+}
 
-    void stop() {
-        if (running) {
-            svr.stop();
-            if (serverThread.joinable()) serverThread.join();
-            running = false;
-        }
+void RackHttpServer::stop() {
+    if (running) {
+        svr.stop();
+        if (serverThread.joinable()) serverThread.join();
+        running = false;
     }
-
-    ~RackHttpServer() { stop(); }
-};
+}
 
 // ─── VCV Rack Module ──────────────────────────────────────────────────────
 
-struct MCPBridge : Module {
-    enum ParamIds {
-        PORT_PARAM,       // knob 2000-9999 (port number)
-        ENABLED_PARAM,    // on/off toggle
-        NUM_PARAMS
-    };
-    enum InputIds  { NUM_INPUTS };
-    enum OutputIds {
-        HEARTBEAT_OUTPUT, // pulses every second while server is running
-        NUM_OUTPUTS
-    };
-    enum LightIds {
-        RUNNING_LIGHT,
-        NUM_LIGHTS
-    };
+MCPBridge::MCPBridge() {
+    config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
+    configParam(PORT_PARAM, 2000.f, 9999.f, 2600.f, "HTTP Port")->snapEnabled = true;
+    configButton(ENABLED_PARAM, "Enable HTTP Server");
+    configOutput(HEARTBEAT_OUTPUT, "Server heartbeat");
+}
 
-    RackHttpServer* server = nullptr;
-    bool wasEnabled = false;
-    float heartbeatPhase = 0.f;
+MCPBridge::~MCPBridge() {
+    stopServer();
+}
 
-    MCPBridge() {
-        config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
-        configParam(PORT_PARAM,    2000.f, 9999.f, 2600.f, "HTTP Port")->snapEnabled = true;
-        configButton(ENABLED_PARAM, "Enable HTTP Server");
-        configOutput(HEARTBEAT_OUTPUT, "Server heartbeat");
+void MCPBridge::startServer(int port) {
+    stopServer();
+    server = new RackHttpServer();
+    server->port = port;
+    server->start();
+    lights[RUNNING_LIGHT].setBrightness(1.f);
+}
+
+void MCPBridge::stopServer() {
+    if (server) {
+        server->stop();
+        delete server;
+        server = nullptr;
     }
+    lights[RUNNING_LIGHT].setBrightness(0.f);
+}
 
-    ~MCPBridge() {
+void MCPBridge::process(const ProcessArgs& args) {
+    bool enabled = params[ENABLED_PARAM].getValue() > 0.5f;
+    int port = (int)params[PORT_PARAM].getValue();
+
+    if (enabled && !wasEnabled) {
+        startServer(port);
+    } else if (!enabled && wasEnabled) {
         stopServer();
     }
+    wasEnabled = enabled;
 
-    void startServer(int port) {
-        stopServer();
-        server = new RackHttpServer();
-        server->port = port;
-        server->start();
-        lights[RUNNING_LIGHT].setBrightness(1.f);
+    if (server && server->running) {
+        heartbeatPhase += args.sampleTime;
+        if (heartbeatPhase >= 1.f) heartbeatPhase -= 1.f;
+        outputs[HEARTBEAT_OUTPUT].setVoltage(heartbeatPhase < 0.05f ? 10.f : 0.f);
+    } else {
+        outputs[HEARTBEAT_OUTPUT].setVoltage(0.f);
     }
+}
 
-    void stopServer() {
-        if (server) {
-            server->stop();
-            delete server;
-            server = nullptr;
-        }
-        lights[RUNNING_LIGHT].setBrightness(0.f);
-    }
+json_t* MCPBridge::dataToJson() {
+    json_t* rootJ = json_object();
+    json_object_set_new(rootJ, "enabled", json_boolean(wasEnabled));
+    return rootJ;
+}
 
-    void process(const ProcessArgs& args) override {
-        bool enabled = params[ENABLED_PARAM].getValue() > 0.5f;
-        int  port    = (int)params[PORT_PARAM].getValue();
-
-        if (enabled && !wasEnabled) {
-            startServer(port);
-        } else if (!enabled && wasEnabled) {
-            stopServer();
-        }
-        wasEnabled = enabled;
-
-        // Heartbeat output: 1Hz pulse when server is running
-        if (server && server->running) {
-            heartbeatPhase += args.sampleTime;
-            if (heartbeatPhase >= 1.f) heartbeatPhase -= 1.f;
-            outputs[HEARTBEAT_OUTPUT].setVoltage(heartbeatPhase < 0.05f ? 10.f : 0.f);
-        } else {
-            outputs[HEARTBEAT_OUTPUT].setVoltage(0.f);
-        }
-    }
-
-    json_t* dataToJson() override {
-        json_t* rootJ = json_object();
-        json_object_set_new(rootJ, "enabled", json_boolean(wasEnabled));
-        return rootJ;
-    }
-
-    void dataFromJson(json_t* rootJ) override {
-        json_t* enabledJ = json_object_get(rootJ, "enabled");
-        if (enabledJ) params[ENABLED_PARAM].setValue(json_boolean_value(enabledJ) ? 1.f : 0.f);
-    }
-};
+void MCPBridge::dataFromJson(json_t* rootJ) {
+    json_t* enabledJ = json_object_get(rootJ, "enabled");
+    if (enabledJ) params[ENABLED_PARAM].setValue(json_boolean_value(enabledJ) ? 1.f : 0.f);
+}
 
 // ─── Widget ───────────────────────────────────────────────────────────────
 
-struct MCPBridgeWidget : ModuleWidget {
-    MCPBridgeWidget(MCPBridge* module) {
+MCPBridgeWidget::MCPBridgeWidget(MCPBridge* module) {
         setModule(module);
         setPanel(createPanel(asset::plugin(pluginInstance, "res/MCPBridge.svg")));
 
@@ -713,26 +677,24 @@ struct MCPBridgeWidget : ModuleWidget {
         // Heartbeat output
         addOutput(createOutputCentered<PJ301MPort>(
             mm2px(Vec(15.24, 110.f)), module, MCPBridge::HEARTBEAT_OUTPUT));
-    }
+}
 
-    void appendContextMenu(Menu* menu) override {
-        MCPBridge* module = getModule<MCPBridge>();
-        menu->addChild(new MenuSeparator);
-        menu->addChild(createMenuItem("Copy server URL", "", [=]() {
-            int port = (int)module->params[MCPBridge::PORT_PARAM].getValue();
-            glfwSetClipboardString(APP->window->win,
-                ("http://127.0.0.1:" + std::to_string(port)).c_str());
-        }));
-        menu->addChild(createMenuItem("Server status", "", [=]() {
-            bool running = module->server && module->server->running;
-            int  port    = (int)module->params[MCPBridge::PORT_PARAM].getValue();
-            std::string msg = running
-                ? "Running on http://127.0.0.1:" + std::to_string(port)
-                : "Stopped";
-            // Display in Rack's notification area
-            APP->scene->addChild(createTransientLabel(msg));
-        }));
-    }
-};
+void MCPBridgeWidget::appendContextMenu(Menu* menu) {
+    MCPBridge* module = getModule<MCPBridge>();
+    menu->addChild(new MenuSeparator);
+    menu->addChild(createMenuItem("Copy server URL", "", [=]() {
+        int port = (int)module->params[MCPBridge::PORT_PARAM].getValue();
+        glfwSetClipboardString(APP->window->win,
+            ("http://127.0.0.1:" + std::to_string(port)).c_str());
+    }));
+    menu->addChild(createMenuItem("Server status", "", [=]() {
+        bool running = module->server && module->server->running;
+        int port = (int)module->params[MCPBridge::PORT_PARAM].getValue();
+        std::string msg = running
+            ? "Running on http://127.0.0.1:" + std::to_string(port)
+            : "Stopped";
+        APP->scene->addChild(createTransientLabel(msg));
+    }));
+}
 
 Model* modelMCPBridge = createModel<MCPBridge, MCPBridgeWidget>("MCPBridge");

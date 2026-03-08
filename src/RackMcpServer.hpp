@@ -1,0 +1,88 @@
+#pragma once
+
+#include "plugin.hpp"
+
+#define CPPHTTPLIB_OPENSSL_SUPPORT 0
+#include <httplib.h>
+
+#include <atomic>
+#include <future>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
+
+struct UITaskQueue {
+    std::mutex mutex;
+    std::queue<std::pair<std::function<void()>, std::shared_ptr<std::promise<void>>>> tasks;
+
+    std::future<void> post(std::function<void()> fn);
+    void drain();
+};
+
+struct RackMcpServer : Module {
+    enum ParamIds { PORT_PARAM, ENABLED_PARAM, NUM_PARAMS };
+    enum InputIds { NUM_INPUTS };
+    enum OutputIds { HEARTBEAT_OUTPUT, NUM_OUTPUTS };
+    enum LightIds { RUNNING_LIGHT, NUM_LIGHTS };
+
+    UITaskQueue taskQueue;
+    class RackHttpServer* server = nullptr;
+    bool wasEnabled = false;
+    float heartbeatPhase = 0.f;
+
+    std::mutex pendingDeleteMutex;
+    std::vector<uint64_t> pendingDeleteIds;
+
+    RackMcpServer();
+    ~RackMcpServer() override;
+
+    void startServer(int port);
+    void stopServer();
+    void process(const ProcessArgs& args) override;
+    json_t* dataToJson() override;
+    void dataFromJson(json_t* rootJ) override;
+};
+
+class RackHttpServer {
+public:
+    httplib::Server svr;
+    std::thread serverThread;
+    std::atomic<bool> running{false};
+    int port = 2600;
+    UITaskQueue* taskQueue = nullptr;
+    RackMcpServer* parent = nullptr;
+    rack::Context* rackApp = nullptr;
+
+    RackHttpServer() = default;
+    ~RackHttpServer();
+
+    rack::math::Vec computeAutoPosition(int64_t nearModuleId = -1);
+    std::string dispatchTool(const std::string& name, const std::string& args);
+    void handleMcpPost(const httplib::Request& req, httplib::Response& res);
+    void setupRoutes();
+    void start();
+    void stop();
+};
+
+struct PortTextField : LedDisplayTextField {
+    RackMcpServer* module = nullptr;
+
+    PortTextField();
+    void step() override;
+    void onSelectKey(const SelectKeyEvent& e) override;
+};
+
+struct PanelLabelWidget : TransparentWidget {
+    void drawLabel(const DrawArgs& args, float x, float y, std::string txt, float fontSize, NVGcolor col, int align = NVG_ALIGN_CENTER);
+    void drawDivider(const DrawArgs& args, float y);
+    void drawCard(const DrawArgs& args, float xMm, float yMm, float wMm, float hMm);
+    void draw(const DrawArgs& args) override;
+};
+
+struct RackMcpServerWidget : ModuleWidget {
+    PortTextField* portField = nullptr;
+
+    explicit RackMcpServerWidget(RackMcpServer* module);
+    void step() override;
+};
