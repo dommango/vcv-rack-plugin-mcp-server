@@ -70,6 +70,7 @@ struct PortTextField : LedDisplayTextField {
 
     PortTextField();
     void step() override;
+    void drawLayer(const DrawArgs& args, int layer) override;
     void onSelectKey(const SelectKeyEvent& e) override;
 };
 

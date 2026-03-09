@@ -1185,7 +1185,7 @@ PortTextField::PortTextField() {
     multiline = false;
     color = nvgRGB(0x7d, 0xec, 0xc2);
     bgColor = nvgRGB(0x14, 0x1d, 0x33);
-    textOffset = Vec(5.f, 0.f);
+    textOffset = Vec(0.f, 0.f);
 }
 
 void PortTextField::step() {
@@ -1196,6 +1196,17 @@ void PortTextField::step() {
         std::string s = std::to_string(p);
         if (text != s) setText(s);
     }
+}
+
+void PortTextField::drawLayer(const DrawArgs& args, int layer) {
+    if (layer != 1) return;
+    nvgScissor(args.vg, RECT_ARGS(args.clipBox));
+    nvgFontFaceId(args.vg, APP->window->uiFont->handle);
+    nvgFontSize(args.vg, 12.f);
+    nvgFillColor(args.vg, color);
+    nvgTextAlign(args.vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
+    nvgText(args.vg, box.size.x / 2.f, box.size.y / 2.f, text.c_str(), NULL);
+    nvgResetScissor(args.vg);
 }
 
 void PortTextField::onSelectKey(const SelectKeyEvent& e) {
@@ -1252,9 +1263,9 @@ void PanelLabelWidget::draw(const DrawArgs& args) {
     drawLabel(args, left, mm2px(62.f), "POWER", 7.2f, label, NVG_ALIGN_LEFT);
     drawCard(args, 4.8f, 65.f, 20.9f, 12.5f);
 
-    drawDivider(args, mm2px(81.f));
-    drawLabel(args, left, mm2px(79.f), "STATUS", 7.2f, label, NVG_ALIGN_LEFT);
-    drawCard(args, 4.8f, 82.f, 20.9f, 12.5f);
+    drawDivider(args, mm2px(78.f));
+    drawLabel(args, left, mm2px(81.f), "STATUS", 7.2f, label, NVG_ALIGN_LEFT);
+    drawCard(args, 4.8f, 84.f, 20.9f, 12.5f);
 
     drawDivider(args, mm2px(100.f));
     drawLabel(args, left, mm2px(102.f), "CLOCK", 7.2f, label, NVG_ALIGN_LEFT);
@@ -1279,7 +1290,7 @@ RackMcpServerWidget::RackMcpServerWidget(RackMcpServer* module) {
         addChild(labels);
 
         // Port text field
-        portField = createWidget<PortTextField>(mm2px(Vec(6.2f, 42.2f)));
+        portField = createWidget<PortTextField>(mm2px(Vec(6.0f, 40.75f)));
         portField->box.size = mm2px(Vec(18.5f, 8.5f));
         portField->module = module;
         portField->setText(module
@@ -1289,15 +1300,15 @@ RackMcpServerWidget::RackMcpServerWidget(RackMcpServer* module) {
 
         // Sticky enable switch
         addParam(createParamCentered<CKSS>(
-            mm2px(Vec(15.24, 68.f)), module, RackMcpServer::ENABLED_PARAM));
+            mm2px(Vec(15.24, 71.25f)), module, RackMcpServer::ENABLED_PARAM));
 
         // Running status LED
         addChild(createLightCentered<MediumLight<GreenLight>>(
-            mm2px(Vec(15.24, 84.f)), module, RackMcpServer::RUNNING_LIGHT));
+            mm2px(Vec(15.24, 90.25f)), module, RackMcpServer::RUNNING_LIGHT));
 
         // Heartbeat output
         addOutput(createOutputCentered<PJ301MPort>(
-            mm2px(Vec(15.24, 108.f)), module, RackMcpServer::HEARTBEAT_OUTPUT));
+            mm2px(Vec(15.24, 112.25f)), module, RackMcpServer::HEARTBEAT_OUTPUT));
 }
 
 void RackMcpServerWidget::step() {
