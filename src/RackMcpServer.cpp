@@ -447,10 +447,20 @@ void RackMcpServer::process(const ProcessArgs& args) {
     if (enabled && !wasEnabled) startServer((int)params[PORT_PARAM].getValue());
     else if (!enabled && wasEnabled) stopServer();
     wasEnabled = enabled;
+
     if (server) {
         heartbeatPhase += args.sampleTime;
         if (heartbeatPhase >= 1.f) heartbeatPhase -= 1.f;
         outputs[HEARTBEAT_OUTPUT].setVoltage(heartbeatPhase < 0.05f ? 10.f : 0.f);
+    }
+
+    // Activity blink: retrigger 150 ms flash on each API call
+    if (activityFlag.exchange(false)) {
+        activityTimer = 0.15f;
+    }
+    if (activityTimer > 0.f) {
+        activityTimer -= args.sampleTime;
+        lights[ACTIVITY_LIGHT].setBrightness(activityTimer > 0.f ? 1.f : 0.f);
     }
 }
 
@@ -1155,6 +1165,11 @@ void RackHttpServer::setupRoutes() {
             res.body   = ": VCV Rack MCP Bridge\n\n";
             res.status = 200;
         });
+
+        // Signal activity LED for every completed request (thread-safe atomic write)
+        svr.set_logger([this](const httplib::Request&, const httplib::Response&) {
+            if (parent) parent->activityFlag.store(true, std::memory_order_relaxed);
+        });
 }
 
 void RackHttpServer::start() {
@@ -1265,11 +1280,15 @@ void PanelLabelWidget::draw(const DrawArgs& args) {
 
     drawDivider(args, mm2px(78.f));
     drawLabel(args, left, mm2px(81.f), "STATUS", 7.2f, label, NVG_ALIGN_LEFT);
-    drawCard(args, 4.8f, 84.f, 20.9f, 12.5f);
+    drawCard(args, 4.8f, 84.f, 20.9f, 14.f);
+    // Sub-labels inside STATUS card
+    NVGcolor sublabel = nvgRGBA(0xaa, 0xb5, 0xd3, 160);
+    drawLabel(args, mm2px(10.5f), mm2px(95.f), "ONLINE", 5.5f, sublabel, NVG_ALIGN_CENTER);
+    drawLabel(args, mm2px(19.5f), mm2px(95.f), "ACTIVE", 5.5f, sublabel, NVG_ALIGN_CENTER);
 
-    drawDivider(args, mm2px(100.f));
-    drawLabel(args, left, mm2px(102.f), "CLOCK", 7.2f, label, NVG_ALIGN_LEFT);
-    drawCard(args, 4.8f, 105.f, 20.9f, 14.5f);
+    drawDivider(args, mm2px(102.f));
+    drawLabel(args, left, mm2px(105.f), "CLOCK", 7.2f, label, NVG_ALIGN_LEFT);
+    drawCard(args, 4.8f, 108.f, 20.9f, 14.5f);
 }
 
 // ─── Widget ───────────────────────────────────────────────────────────────
@@ -1302,13 +1321,17 @@ RackMcpServerWidget::RackMcpServerWidget(RackMcpServer* module) {
         addParam(createParamCentered<CKSS>(
             mm2px(Vec(15.24, 71.25f)), module, RackMcpServer::ENABLED_PARAM));
 
-        // Running status LED
+        // STATUS: online LED (green) — left column
         addChild(createLightCentered<MediumLight<GreenLight>>(
-            mm2px(Vec(15.24, 90.25f)), module, RackMcpServer::RUNNING_LIGHT));
+            mm2px(Vec(10.5f, 90.f)), module, RackMcpServer::RUNNING_LIGHT));
 
-        // Heartbeat output
+        // STATUS: activity LED (yellow) — right column, blinks on API calls
+        addChild(createLightCentered<MediumLight<YellowLight>>(
+            mm2px(Vec(19.5f, 90.f)), module, RackMcpServer::ACTIVITY_LIGHT));
+
+        // Heartbeat output — re-centered in shifted CLOCK card (108–122.5 mm)
         addOutput(createOutputCentered<PJ301MPort>(
-            mm2px(Vec(15.24, 112.25f)), module, RackMcpServer::HEARTBEAT_OUTPUT));
+            mm2px(Vec(15.24f, 115.25f)), module, RackMcpServer::HEARTBEAT_OUTPUT));
 }
 
 void RackMcpServerWidget::step() {

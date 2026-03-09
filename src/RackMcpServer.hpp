@@ -24,12 +24,16 @@ struct RackMcpServer : Module {
     enum ParamIds { PORT_PARAM, ENABLED_PARAM, NUM_PARAMS };
     enum InputIds { NUM_INPUTS };
     enum OutputIds { HEARTBEAT_OUTPUT, NUM_OUTPUTS };
-    enum LightIds { RUNNING_LIGHT, NUM_LIGHTS };
+    enum LightIds { RUNNING_LIGHT, ACTIVITY_LIGHT, NUM_LIGHTS };
 
     UITaskQueue taskQueue;
     class RackHttpServer* server = nullptr;
     bool wasEnabled = false;
     float heartbeatPhase = 0.f;
+
+    // Activity indicator — written by HTTP thread, read by audio thread
+    std::atomic<bool> activityFlag{false};
+    float activityTimer = 0.f;
 
     std::mutex pendingDeleteMutex;
     std::vector<uint64_t> pendingDeleteIds;
