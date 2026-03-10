@@ -28,3 +28,4 @@ CMakeUserPresets.json
 # Local AI assistant config
 .claude/
 .cache/
+patches/

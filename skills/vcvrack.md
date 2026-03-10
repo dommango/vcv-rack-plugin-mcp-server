@@ -68,24 +68,73 @@ In VCV Rack, **modules do nothing on their own**. You must connect them with **v
 ### status — Server health check
 ... (rest of status) ...
 
+### layout — Rack spatial map (**call this before every `add`**)
+
+```bash
+python skills/vcvrack_client.py layout
+```
+
+### mcp-position — MCP Server root anchor
+
+```bash
+python skills/vcvrack_client.py mcp-position
+```
+
+Use this when you only need the MCP Server module's root `x/y` position. It returns the same anchor used by `layout` as `mcp_module`, but without the rest of the rack geometry.
+
+Response:
+
+```json
+{
+  "ok": true,
+  "data": {
+    "grid_unit_px": 15,
+    "row_height_px": 380,
+    "mcp_module": { "x": 30315, "y": 38000 },
+    "rows": [
+      { "row": 100, "y": 38000, "left_edge": 30315, "right_edge": 30405, "module_count": 1 }
+    ],
+    "suggested_positions": [
+      { "label": "append_row_100", "description": "Append to row 100 (y=38000, 1 modules)", "x": 30405, "y": 38000 },
+      { "label": "append_mcp_row", "description": "Append directly to the row containing the MCP module", "x": 30405, "y": 38000 },
+      { "label": "insert_before_output", "description": "Insert before the terminal output module on the MCP row so Audio stays at the far right", "x": 31200, "y": 38000 },
+      { "label": "new_row",        "description": "Start a fresh row below all existing modules, horizontally aligned with the MCP module", "x": 30315, "y": 38380 }
+    ]
+  }
+}
+```
+
+**Coordinate system:**
+- `x` and `y` are in VCV Rack pixel units. Pass them directly to `add`.
+- One **HP** (the standard module width unit) = **15 px**.
+- One **row** = **380 px** tall. Rows stack vertically: row 0 at y=0, row 1 at y=380, etc.
+- `mcp_module` is the layout anchor. Treat its `x/y` as the reference point for the patch section controlled by the MCP server.
+- `right_edge` of a row is the x coordinate of the first free slot in that row.
+
+**Placement rules (follow strictly):**
+1. **Always call `layout` first.** Never add a module without knowing the current rack geometry.
+2. **Always pass explicit `x y`** to `add`. Never rely on auto-placement.
+3. If the new module belongs near the MCP Server, prefer `append_mcp_row`. This is the safest default for building one contiguous patch near the root MCP module.
+4. If the row already ends with an audio output module and you are extending the signal chain, prefer `insert_before_output` so `Audio 2` stays at the far right.
+5. To extend a different existing row, pick the matching `append_row_N`.
+6. To start a logically separate section, use `new_row`, which begins directly below the current patch and keeps the same horizontal anchor as `mcp_module.x`.
+7. Modules are snapped to the HP grid (15 px). The server handles snapping automatically, so passing `right_edge` directly is always safe.
+
 ### add — Add a module to the patch
 
 ```bash
-# Auto-placed next to the last added module and centered in view
-python skills/vcvrack_client.py add <plugin_slug> <module_slug>
-
-# At specific grid position
+# ALWAYS provide x y (obtained from `layout`)
 python skills/vcvrack_client.py add <plugin_slug> <module_slug> <x> <y>
 ```
 
 Response:
 
 ```json
-{ "ok": true, "data": { "id": 42, "plugin": "VCV", "slug": "VCO-1", "x": 0, "y": 0 } }
+{ "ok": true, "data": { "id": 42, "plugin": "VCV", "slug": "VCO-1", "x": 1220, "y": 0, "width": 120 } }
 ```
 
 > **Save the returned `id`** — you need it for params and cables.
-> **Note:** The server automatically scrolls the Rack view to center newly added modules.
+> **Save the returned `width`** — add it to the module's `x` to get the `x` for the next module in the same row.
 
 ... (rest of commands) ...
 
@@ -112,16 +161,17 @@ Response:
 Building a patch is an iterative process of adding, configuring, and **wiring**:
 
 ```
-status → library → add → module → connect → set-param → save
+status → library → layout → add (x y) → module → connect → set-param → save
 ```
 
 1.  **`status`** — Confirm server is alive.
 2.  **`library`** — Find exact plugin + module slugs.
-3.  **`add`** — Place modules in the rack. They will appear to the right of the Server module and be centered in your view.
-4.  **`module <id>`** — **Discovery Phase.** List the available inputs, outputs, and parameters.
-5.  **`connect`** — **Wiring Phase.** Link an `output` of one module to the `input` of another. (e.g., VCO Sine Out -> Audio In).
-6.  **`set-param`** — **Tuning Phase.** Adjust knobs using the raw ranges returned by `params`. Prefer one or two changes at a time, then re-read the params to verify the result.
-7.  **`save`** — Persist your creation.
+3.  **`layout`** — **Always call this before adding any module.** Read `suggested_positions` to pick the right `x y` for each `add`. After adding a module, use its returned `width` to compute the next free x in the same row (`next_x = x + width`), so you can batch-add several modules without calling `layout` again after each one.
+4.  **`add <plugin> <slug> <x> <y>`** — Place the module at the coordinates from step 3. Never omit `x y`.
+5.  **`module <id>`** — **Discovery Phase.** List the available inputs, outputs, and parameters.
+6.  **`connect`** — **Wiring Phase.** Link an `output` of one module to the `input` of another. (e.g., VCO Sine Out -> Audio In).
+7.  **`set-param`** — **Tuning Phase.** Adjust knobs using the raw ranges returned by `params`. Prefer one or two changes at a time, then re-read the params to verify the result.
+8.  **`save`** — Persist your creation.
 
 ## Parameter Safety Rules
 

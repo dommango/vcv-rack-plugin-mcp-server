@@ -13,10 +13,16 @@
 #include <vector>
 
 struct UITaskQueue {
-    std::mutex mutex;
-    std::queue<std::pair<std::function<void()>, std::shared_ptr<std::promise<void>>>> tasks;
+    struct Task {
+        std::function<void()>          fn;
+        std::shared_ptr<std::promise<void>> promise;
+        std::string                    label;
+    };
 
-    std::future<void> post(std::function<void()> fn);
+    std::mutex       mutex;
+    std::queue<Task> tasks;
+
+    std::future<void> post(std::function<void()> fn, const std::string& label = "");
     void drain();
 };
 
@@ -37,6 +43,12 @@ struct RackMcpServer : Module {
 
     std::mutex pendingDeleteMutex;
     std::vector<uint64_t> pendingDeleteIds;
+
+    // User-configurable layout bounds, anchored from the MCP module position.
+    // cols_hp/rows set to 0 mean "unbounded".
+    std::mutex layoutPrefsMutex;
+    int layoutMatrixColsHp = 0;
+    int layoutMatrixRows = 0;
 
     RackMcpServer();
     ~RackMcpServer() override;
@@ -61,6 +73,7 @@ public:
     RackHttpServer() = default;
     ~RackHttpServer();
 
+    std::string getLayoutPrefsJson();
     rack::math::Vec computeAutoPosition(int64_t nearModuleId = -1);
     std::string dispatchTool(const std::string& name, const std::string& args);
     void handleMcpPost(const httplib::Request& req, httplib::Response& res);

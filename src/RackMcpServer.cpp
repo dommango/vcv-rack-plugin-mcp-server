@@ -13,7 +13,6 @@
 #include <rack.hpp>
 #include <app/RackWidget.hpp>
 #include <app/ModuleWidget.hpp>
-#include <patch.hpp>
 #include <tag.hpp>
 
 #include <sstream>
@@ -23,30 +22,43 @@ using namespace rack;
 
 // ─── UI Task Queue ─────────────────────────────────────────────────────────
 
-std::future<void> UITaskQueue::post(std::function<void()> fn) {
+std::future<void> UITaskQueue::post(std::function<void()> fn, const std::string& label) {
     auto p = std::make_shared<std::promise<void>>();
     {
         std::lock_guard<std::mutex> lock(mutex);
-        tasks.push({fn, p});
+        tasks.push({fn, p, label});
     }
     return p->get_future();
 }
 
 void UITaskQueue::drain() {
-    std::queue<std::pair<std::function<void()>, std::shared_ptr<std::promise<void>>>> local;
+    std::queue<Task> local;
     {
         std::lock_guard<std::mutex> lock(mutex);
         std::swap(local, tasks);
     }
     while (!local.empty()) {
-        auto& [fn, p] = local.front();
-        try { fn(); p->set_value(); }
-        catch (...) { p->set_exception(std::current_exception()); }
+        auto& task = local.front();
+        const std::string& lbl = task.label.empty() ? "(unlabelled)" : task.label;
+        INFO("[RackMcpServer] drain: executing task '%s'", lbl.c_str());
+        try {
+            task.fn();
+            task.promise->set_value();
+            INFO("[RackMcpServer] drain: task '%s' completed", lbl.c_str());
+        } catch (const std::exception& e) {
+            WARN("[RackMcpServer] drain: task '%s' threw exception: %s", lbl.c_str(), e.what());
+            task.promise->set_exception(std::current_exception());
+        } catch (...) {
+            WARN("[RackMcpServer] drain: task '%s' threw unknown exception", lbl.c_str());
+            task.promise->set_exception(std::current_exception());
+        }
         local.pop();
     }
 }
 
 // ─── tiny JSON builder helpers ─────────────────────────────────────────────
+
+// ─── JSON helpers ─────────────────────────────────────────────────────────────
 
 static std::string jsonStr(const std::string& s) {
     std::string out = "\"";
@@ -171,11 +183,13 @@ static std::string serializeModuleSummary(engine::Module* mod) {
         s += jsonKV("outputs", std::to_string(mod->outputs.size()));
         app::ModuleWidget* mw = APP->scene->rack->getModule(mod->id);
         if (mw) {
-            s += jsonKV("x", std::to_string(mw->box.pos.x));
-            s += jsonKV("y", std::to_string(mw->box.pos.y), true);
+            s += jsonKV("x", std::to_string((int)mw->box.pos.x));
+            s += jsonKV("y", std::to_string((int)mw->box.pos.y));
+            s += jsonKV("width", std::to_string((int)mw->box.size.x), true);
         } else {
-            s += jsonKV("x", "0", false);
-            s += jsonKV("y", "0", true);
+            s += jsonKV("x", "0");
+            s += jsonKV("y", "0");
+            s += jsonKV("width", "0", true);
         }
     }
     s += "}";
@@ -324,13 +338,46 @@ static std::string toolFail(const std::string& text) {
     return "{\"content\":[{\"type\":\"text\",\"text\":" + jsonStr(text) + "}],\"isError\":true}";
 }
 
+static std::string getMcpModulePositionJson(app::RackWidget* rackWidget, int64_t mcpId) {
+    if (!rackWidget || mcpId < 0) {
+        return "{" + jsonKV("id", std::to_string(mcpId))
+                   + jsonKV("x", "0")
+                   + jsonKV("y", "0")
+                   + jsonKV("found", "false", true) + "}";
+    }
+    app::ModuleWidget* mw = rackWidget->getModule(mcpId);
+    if (!mw) {
+        return "{" + jsonKV("id", std::to_string(mcpId))
+                   + jsonKV("x", "0")
+                   + jsonKV("y", "0")
+                   + jsonKV("found", "false", true) + "}";
+    }
+    return "{" + jsonKV("id", std::to_string(mcpId))
+               + jsonKV("x", std::to_string((int)mw->box.pos.x))
+               + jsonKV("y", std::to_string((int)mw->box.pos.y))
+               + jsonKV("found", "true", true) + "}";
+}
+
+static bool isTerminalOutputModule(const app::ModuleWidget* mw) {
+    if (!mw || !mw->model || !mw->model->plugin) return false;
+    const std::string pluginSlug = mw->model->plugin->slug;
+    const std::string modelSlug = mw->model->slug;
+    if (pluginSlug == "Core" &&
+        (modelSlug == "AudioInterface2" || modelSlug == "AudioInterface" || modelSlug == "AudioInterface16")) {
+        return true;
+    }
+    return false;
+}
+
 // ─── MCP tools list (JSON Schema for each tool) ────────────────────────────
 
 static const char* MCP_TOOLS_JSON = R"json([
 {"name":"vcvrack_get_status","description":"Get VCV Rack server status: version, sample rate, and loaded module count.","inputSchema":{"type":"object","properties":{}}},
-{"name":"vcvrack_list_modules","description":"List all modules currently loaded in the VCV Rack patch with their IDs, slugs, and port counts.","inputSchema":{"type":"object","properties":{}}},
+{"name":"vcvrack_get_mcp_position","description":"Get the MCP Server module's root position in rack pixel coordinates. Use this as the starting anchor before placing related modules.","inputSchema":{"type":"object","properties":{}}},
+{"name":"vcvrack_get_rack_layout","description":"Get a spatial map of the rack: all rows, their occupied x ranges, the MCP module position, and ready-to-use suggested_positions for placing new modules. ALWAYS call this before vcvrack_add_module to get explicit x/y coordinates. Never rely on auto-placement.\n\nResponse fields:\n- grid_unit_px: 1 HP = 15 px (standard VCV Rack unit)\n- row_height_px: 380 px per row (one 3U row)\n- mcp_module: the MCP Server module's current x/y position. Use this as the anchor when deciding whether to extend the MCP row or start a new aligned row.\n- rows[]: each row has y (top of row), left_edge, right_edge (first free x in that row), module_count\n- suggested_positions[]: pre-computed insertion points. Each entry has label, description, x, y. Prefer 'append_mcp_row' for modules that belong with the main MCP section, and prefer 'insert_before_output' when the row already ends with Audio Interface modules so outputs stay on the far right.\n\nBatching: when adding several modules to the same row, compute the next x yourself as: next_x = previous_x + width_returned_by_add. This avoids calling layout again between each add.","inputSchema":{"type":"object","properties":{}}},
+{"name":"vcvrack_list_modules","description":"List all modules currently loaded in the VCV Rack patch. Each entry includes id, plugin, slug, name, param/input/output counts, x position, y position, and width (in pixels). Use x + width to compute where the next module should go in the same row.","inputSchema":{"type":"object","properties":{}}},
 {"name":"vcvrack_get_module","description":"Get detailed information about a specific module: all parameters (with value ranges), inputs, and outputs.","inputSchema":{"type":"object","properties":{"id":{"type":"integer","description":"Module ID"}},"required":["id"]}},
-{"name":"vcvrack_add_module","description":"Add a new module to the VCV Rack patch. Modules are auto-positioned to the right of the MCP bridge module by default. Use nearModuleId to place a module next to a specific related module (e.g. place a VCF right next to a VCO). Use vcvrack_search_library to discover valid plugin/slug values.","inputSchema":{"type":"object","properties":{"plugin":{"type":"string","description":"Plugin slug (e.g. 'Fundamental')"},"slug":{"type":"string","description":"Module slug (e.g. 'VCO-1')"},"nearModuleId":{"type":"integer","description":"Optional: ID of an existing module to place this new module next to (immediately to its right). Use this to keep related modules together."},"x":{"type":"number","description":"X position in pixels (optional, overrides auto-placement)"},"y":{"type":"number","description":"Y position in pixels (optional, used only when x is also provided)"}},"required":["plugin","slug"]}},
+{"name":"vcvrack_add_module","description":"Add a new module to the VCV Rack patch at an explicit pixel position.\n\nMANDATORY PLACEMENT WORKFLOW — follow this every time:\n1. Call vcvrack_get_rack_layout to get mcp_module, rows, and suggested_positions.\n2. Use mcp_module as your spatial anchor to decide whether the module belongs on the MCP row, another existing row, or a new aligned row.\n3. Prefer 'append_mcp_row' for modules related to the main patch section. If the row already ends with Audio Interface modules, prefer 'insert_before_output' so Audio stays at the far right.\n4. Pass the chosen x and y values here. Both x and y are required.\n5. The response includes the new module's width. Store it: next_x = x + width for the following module in the same row.\n\nNever omit x/y. Never auto-place. Consistent explicit positioning keeps the rack readable.\n\nUse vcvrack_search_library to discover valid plugin/slug values before adding.","inputSchema":{"type":"object","properties":{"plugin":{"type":"string","description":"Plugin slug (e.g. 'Fundamental')"},"slug":{"type":"string","description":"Module slug (e.g. 'VCO-1')"},"x":{"type":"number","description":"X position in pixels — obtain from vcvrack_get_rack_layout suggested_positions, or compute as previous_x + previous_width"},"y":{"type":"number","description":"Y position in pixels — obtain from vcvrack_get_rack_layout suggested_positions (e.g. 0 for row 0, 380 for row 1)"}},"required":["plugin","slug","x","y"]}},
 {"name":"vcvrack_delete_module","description":"Delete a module from the VCV Rack patch by ID.","inputSchema":{"type":"object","properties":{"id":{"type":"integer","description":"Module ID to delete"}},"required":["id"]}},
 {"name":"vcvrack_get_params","description":"Get all parameters of a module with names, value ranges, current raw values, display strings, and switch options when available. Use this before setting params because many Rack controls are normalized knob values rather than Hz or seconds.","inputSchema":{"type":"object","properties":{"moduleId":{"type":"integer","description":"Module ID"}},"required":["moduleId"]}},
 {"name":"vcvrack_set_params","description":"Set one or more parameters on a module. Always call vcvrack_get_params first to discover parameter IDs, min/max ranges, display strings, and switch options. Prefer small batches, keep values inside the reported min/max range, and re-read params after writing to confirm the change applied.","inputSchema":{"type":"object","properties":{"moduleId":{"type":"integer","description":"Module ID"},"params":{"type":"array","description":"Array of parameter updates","items":{"type":"object","properties":{"id":{"type":"integer","description":"Parameter index (0-based)"},"value":{"type":"number","description":"New parameter value"}},"required":["id","value"]}}},"required":["moduleId","params"]}},
@@ -339,9 +386,7 @@ static const char* MCP_TOOLS_JSON = R"json([
 {"name":"vcvrack_delete_cable","description":"Remove a cable connection by cable ID.","inputSchema":{"type":"object","properties":{"id":{"type":"integer","description":"Cable ID"}},"required":["id"]}},
 {"name":"vcvrack_get_sample_rate","description":"Get the current audio engine sample rate in Hz.","inputSchema":{"type":"object","properties":{}}},
 {"name":"vcvrack_search_library","description":"Search the installed plugin library for modules by name, slug, or tag. Use this to discover plugin slugs and module slugs before calling vcvrack_add_module.","inputSchema":{"type":"object","properties":{"q":{"type":"string","description":"Search query matching slug, name, or description"},"tags":{"type":"string","description":"Tag filter e.g. 'VCO', 'VCF', 'LFO', 'Envelope', 'Mixer'"}},"required":[]}},
-{"name":"vcvrack_get_plugin","description":"Get detailed information about an installed plugin and its full module list.","inputSchema":{"type":"object","properties":{"slug":{"type":"string","description":"Plugin slug"}},"required":["slug"]}},
-{"name":"vcvrack_save_patch","description":"Save the current VCV Rack patch to a .vcv file.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute file path (e.g. '/home/user/patches/my_patch.vcv')"}},"required":["path"]}},
-{"name":"vcvrack_load_patch","description":"Load a VCV Rack patch from a .vcv file, replacing the current patch.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute file path to load"}},"required":["path"]}}
+{"name":"vcvrack_get_plugin","description":"Get detailed information about an installed plugin and its full module list.","inputSchema":{"type":"object","properties":{"slug":{"type":"string","description":"Plugin slug"}},"required":["slug"]}}
 ])json";
 
 // ─── MCP prompts ────────────────────────────────────────────────────────────
@@ -368,6 +413,13 @@ static const char* MCP_PROMPTS_JSON = R"json([
   "arguments": [
     {"name": "module", "description": "Module name or ID to configure", "required": true}
   ]
+},
+{
+  "name": "add_modules_to_rack",
+  "description": "Guide for placing one or more new modules into the rack with correct spatial positioning. Use this whenever modules need to be added to an existing or new patch.",
+  "arguments": [
+    {"name": "modules", "description": "Comma-separated list of modules to add (e.g. 'VCO, VCF, VCA')", "required": true}
+  ]
 }
 ])json";
 
@@ -389,16 +441,36 @@ static std::string buildPromptMessages(const std::string& name, const std::strin
         if (desc.empty()) desc = "a patch";
         std::string text =
             "You are building a VCV Rack patch: " + desc + ".\n\n"
-            "Follow these steps:\n"
+            "Follow these steps in order:\n\n"
+            "PREPARATION\n"
             "1. Call vcvrack_get_status to confirm the server is running.\n"
-            "2. Call vcvrack_search_library to find suitable modules (VCO, VCF, VCA, ADSR, Audio, etc.).\n"
-            "3. Call vcvrack_add_module for each required module, noting the returned module ID.\n"
-            "4. Call vcvrack_get_module on each module to discover input/output port indices.\n"
-            "5. Call vcvrack_add_cable to wire the signal path (e.g. VCO OUT -> VCF IN -> VCA IN -> Audio IN).\n"
-            "6. Call vcvrack_get_params before every tuning step so you can see each control's raw range, display string, and any switch labels.\n"
-            "7. Use vcvrack_set_params in small batches and only with values inside the reported min/max range. Remember that many Rack knobs are normalized control values, not direct musical units such as Hz.\n"
-            "8. After each write, call vcvrack_get_params again to confirm the values changed as expected before continuing.\n"
-            "9. Optionally call vcvrack_save_patch to persist the patch.\n\n"
+            "2. Call vcvrack_get_mcp_position to get the root MCP module anchor.\n"
+            "3. Call vcvrack_search_library to find all required modules (VCO, VCF, VCA, ADSR, Audio, etc.).\n"
+            "   Collect plugin slug and module slug for every module you plan to add.\n\n"
+            "PLACEMENT — always do this before any vcvrack_add_module call\n"
+            "4. Call vcvrack_get_rack_layout once. Inspect mcp_module, rows, and suggested_positions:\n"
+            "   - Use mcp_module as the anchor for deciding where this section belongs.\n"
+            "   - Prefer 'append_mcp_row' if the modules belong near the MCP root module.\n"
+            "   - If the MCP row already ends with Audio Interface modules, prefer 'insert_before_output' so Audio remains the terminal module.\n"
+            "   - If the patch should extend the MCP row or another existing row, use that row's 'append_row_N'.\n"
+            "   - Use 'new_row' only if starting a logically separate section aligned with mcp_module.x.\n"
+            "   Note: grid_unit_px=15 (1 HP), row_height_px=380 (one 3U row).\n"
+            "5. Call vcvrack_add_module for each required module, passing x and y from step 4.\n"
+            "   After each add, store the returned width. Compute the next module's x as:\n"
+            "     next_x = current_x + returned_width\n"
+            "   This lets you add a whole row of modules without calling vcvrack_get_rack_layout again.\n"
+            "   Save every returned module ID — you will need them for cables and params.\n\n"
+            "WIRING\n"
+            "6. Call vcvrack_get_module on each module to discover input/output port indices and their labels.\n"
+            "7. Call vcvrack_add_cable to wire the signal path (e.g. VCO OUT -> VCF IN -> VCA IN -> Audio IN).\n"
+            "   Verify each cable with vcvrack_list_cables if unsure.\n\n"
+            "TUNING\n"
+            "8. Call vcvrack_get_params before every tuning step to read each control's raw range,\n"
+            "   display string, and switch labels. Never guess units from the parameter name alone.\n"
+            "9. Use vcvrack_set_params in small batches, keeping values inside the reported min/max range.\n"
+            "   Many Rack knobs are normalized control values, not literal Hz or seconds.\n"
+            "10. After each write, call vcvrack_get_params again to confirm the change before continuing.\n\n"
+            "FINISHING\n"
             "Always verify each step's result before proceeding to the next.";
         return "[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":" + jsonStr(text) + "}}]";
     }
@@ -427,6 +499,41 @@ static std::string buildPromptMessages(const std::string& name, const std::strin
             "3. Do not guess units from the parameter name alone. Many modules expose normalized control values, so use the reported display string and ranges as the source of truth.\n"
             "4. Call vcvrack_set_params with a small array of {id, value} objects that stay inside the reported range.\n"
             "5. Call vcvrack_get_params again to confirm the values were applied before making more edits.";
+        return "[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":" + jsonStr(text) + "}}]";
+    }
+
+    if (name == "add_modules_to_rack") {
+        std::string mods = argVal("modules");
+        if (mods.empty()) mods = "the requested modules";
+        std::string text =
+            "You need to add the following modules to the VCV Rack patch: " + mods + ".\n\n"
+            "MANDATORY PLACEMENT WORKFLOW — follow exactly:\n\n"
+            "1. Call vcvrack_get_mcp_position.\n"
+            "   Use the returned x/y as the root anchor for the patch section you are extending.\n\n"
+            "2. Call vcvrack_get_rack_layout.\n"
+            "   Read the response carefully:\n"
+            "   - 'mcp_module' gives the MCP Server module's x/y position. Use it as the anchor for layout decisions.\n"
+            "   - 'rows' shows every occupied row with its y coordinate, left/right edges, and module count.\n"
+            "   - 'suggested_positions' gives ready-to-use x/y pairs:\n"
+            "       'append_mcp_row' — preferred default for modules that belong near the MCP root row.\n"
+            "       'insert_before_output' — insert before terminal Audio Interface modules so outputs stay on the far right.\n"
+            "       'append_row_N' — place next to existing modules in row N.\n"
+            "       'new_row'      — start a completely new row below all current content, aligned with mcp_module.x.\n"
+            "   - grid_unit_px=15 means 1 HP = 15 px. row_height_px=380 means one 3U row = 380 px.\n\n"
+            "3. Choose the right suggested position:\n"
+            "   - First decide which row the module group belongs on relative to mcp_module.\n"
+            "   - If the module belongs with the MCP root section, prefer 'append_mcp_row'.\n"
+            "   - If the row already ends with Audio Interface modules and you are extending the signal chain, prefer 'insert_before_output'.\n"
+            "   - If it should extend an existing row, use that row's 'append_row_N'.\n"
+            "   - If it should start a new, independent signal chain, use 'new_row'.\n\n"
+            "4. Call vcvrack_add_module for the first module with the chosen x and y.\n"
+            "   The response includes the module's 'width' in pixels.\n\n"
+            "5. For each subsequent module in the same row, compute:\n"
+            "     next_x = previous_x + previous_width\n"
+            "   Call vcvrack_add_module with next_x and the same y.\n"
+            "   Do NOT call vcvrack_get_rack_layout again between modules in the same row.\n\n"
+            "6. Save every returned module ID for wiring and parameter configuration.\n\n"
+            "Never omit x and y. Never rely on auto-placement. Explicit coordinates keep the rack tidy.";
         return "[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":" + jsonStr(text) + "}}]";
     }
 
@@ -510,6 +617,7 @@ rack::math::Vec RackHttpServer::computeAutoPosition(int64_t nearModuleId) {
 // ─── MCP tool dispatcher ────────────────────────────────────────────────
 
 std::string RackHttpServer::dispatchTool(const std::string& name, const std::string& args) {
+        INFO("[RackMcpServer] dispatchTool → %s", name.c_str());
         auto* rackApp = this->rackApp;
 
         if (name == "vcvrack_get_status") {
@@ -518,10 +626,19 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                 if (!rackApp || !rackApp->engine) return;
                 sr = rackApp->engine->getSampleRate();
                 count = (int)rackApp->engine->getModuleIds().size();
-            }).get();
+            }, "get_status").get();
             return toolOk("{\"server\":\"VCV Rack MCP Bridge\",\"version\":\"1.3.0\","
                           "\"sampleRate\":" + std::to_string(sr) +
                           ",\"moduleCount\":" + std::to_string(count) + "}");
+        }
+
+        if (name == "vcvrack_get_mcp_position") {
+            std::string body;
+            int64_t mcpId = parent ? parent->id : -1;
+            taskQueue->post([rackApp, &body, mcpId]() {
+                body = getMcpModulePositionJson(rackApp && rackApp->scene ? rackApp->scene->rack : nullptr, mcpId);
+            }, "get_mcp_position").get();
+            return toolOk(body);
         }
 
         if (name == "vcvrack_list_modules") {
@@ -536,7 +653,7 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                     if (i < ids.size() - 1) body += ",";
                 }
                 body += "]";
-            }).get();
+            }, "list_modules").get();
             return toolOk(body);
         }
 
@@ -548,9 +665,96 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                 if (!rackApp || !rackApp->engine) return;
                 engine::Module* mod = rackApp->engine->getModule(id);
                 body = mod ? serializeModuleDetail(mod) : "";
-            }).get();
+            }, "get_module/" + std::to_string(id)).get();
             if (body.empty()) return toolFail("Module not found: " + std::to_string(id));
             return toolOk(body);
+        }
+
+        if (name == "vcvrack_get_rack_layout") {
+            struct RowInfo { float y; float left; float right; int count; };
+            std::map<int, RowInfo> rows;
+            std::map<int, float> rowTerminalOutputX;
+            float mcpX = 0.f, mcpY = 0.f;
+            int64_t mcpId = parent ? parent->id : -1;
+            taskQueue->post([rackApp, &rows, &rowTerminalOutputX, &mcpX, &mcpY, mcpId]() {
+                if (!rackApp || !rackApp->engine) return;
+                for (int64_t id : rackApp->engine->getModuleIds()) {
+                    app::ModuleWidget* mw = rackApp->scene->rack->getModule(id);
+                    if (!mw) continue;
+                    if (id == mcpId) { mcpX = mw->box.pos.x; mcpY = mw->box.pos.y; }
+                    int rowIdx = (int)std::round(mw->box.pos.y / RACK_GRID_HEIGHT);
+                    float rowY  = rowIdx * RACK_GRID_HEIGHT;
+                    float right = mw->box.pos.x + mw->box.size.x;
+                    if (isTerminalOutputModule(mw)) {
+                        auto outIt = rowTerminalOutputX.find(rowIdx);
+                        if (outIt == rowTerminalOutputX.end() || mw->box.pos.x < outIt->second) {
+                            rowTerminalOutputX[rowIdx] = mw->box.pos.x;
+                        }
+                    }
+                    auto it = rows.find(rowIdx);
+                    if (it == rows.end()) {
+                        rows[rowIdx] = {rowY, mw->box.pos.x, right, 1};
+                    } else {
+                        it->second.left  = std::min(it->second.left,  mw->box.pos.x);
+                        it->second.right = std::max(it->second.right, right);
+                        it->second.count++;
+                    }
+                }
+            }, "get_rack_layout").get();
+            std::string rowsJson = "[";
+            bool first = true;
+            for (auto& [idx, r] : rows) {
+                if (!first) rowsJson += ",";
+                rowsJson += "{" + jsonKV("row", std::to_string(idx))
+                          + jsonKV("y",            std::to_string((int)r.y))
+                          + jsonKV("left_edge",    std::to_string((int)r.left))
+                          + jsonKV("right_edge",   std::to_string((int)r.right))
+                          + jsonKV("module_count", std::to_string(r.count), true) + "}";
+                first = false;
+            }
+            rowsJson += "]";
+            std::string sugJson = "[";
+            bool sfirst = true;
+            int mcpRowIdx = (int)std::round(mcpY / RACK_GRID_HEIGHT);
+            for (auto& [idx, r] : rows) {
+                if (!sfirst) sugJson += ",";
+                sugJson += "{" + jsonKVs("label", "append_row_" + std::to_string(idx))
+                         + jsonKVs("description", "Append to row " + std::to_string(idx) + " (y=" + std::to_string((int)r.y) + ", " + std::to_string(r.count) + " modules)")
+                         + jsonKV("x", std::to_string((int)r.right))
+                         + jsonKV("y", std::to_string((int)r.y), true) + "}";
+                sfirst = false;
+            }
+            auto mcpRowIt = rows.find(mcpRowIdx);
+            if (mcpRowIt != rows.end()) {
+                if (!sfirst) sugJson += ",";
+                sugJson += "{" + jsonKVs("label", "append_mcp_row")
+                         + jsonKVs("description", "Append directly to the row containing the MCP module (recommended for related modules)")
+                         + jsonKV("x", std::to_string((int)mcpRowIt->second.right))
+                         + jsonKV("y", std::to_string((int)mcpRowIt->second.y), true) + "}";
+                sfirst = false;
+                auto outIt = rowTerminalOutputX.find(mcpRowIdx);
+                if (outIt != rowTerminalOutputX.end()) {
+                    if (!sfirst) sugJson += ",";
+                    sugJson += "{" + jsonKVs("label", "insert_before_output")
+                             + jsonKVs("description", "Insert before the terminal output module on the MCP row so Audio stays at the far right")
+                             + jsonKV("x", std::to_string((int)outIt->second))
+                             + jsonKV("y", std::to_string((int)mcpRowIt->second.y), true) + "}";
+                    sfirst = false;
+                }
+            }
+            int newRowIdx = rows.empty() ? 0 : (rows.rbegin()->first + 1);
+            int newRowY   = newRowIdx * (int)RACK_GRID_HEIGHT;
+            if (!sfirst) sugJson += ",";
+            sugJson += "{" + jsonKVs("label", "new_row")
+                     + jsonKVs("description", "Start a fresh row below all existing modules, horizontally aligned with the MCP module")
+                     + jsonKV("x", std::to_string((int)mcpX))
+                     + jsonKV("y", std::to_string(newRowY), true) + "}";
+            sugJson += "]";
+            std::string mcpJson = "{" + jsonKV("x", std::to_string((int)mcpX))
+                               + jsonKV("y", std::to_string((int)mcpY), true) + "}";
+            return toolOk("{\"grid_unit_px\":15,\"row_height_px\":380,\"mcp_module\":" + mcpJson
+                        + ",\"rows\":" + rowsJson
+                        + ",\"suggested_positions\":" + sugJson + "}");
         }
 
         if (name == "vcvrack_add_module") {
@@ -558,15 +762,16 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
             std::string mSlug = parseJsonString(args, "slug");
             float x = (float)parseJsonDouble(args, "x", -1.0);
             float y = (float)parseJsonDouble(args, "y", -1.0);
-            int64_t nearId = (int64_t)parseJsonDouble(args, "nearModuleId", -1.0);
             plugin::Model* model = nullptr;
             for (plugin::Plugin* p : rack::plugin::plugins)
                 if (p->slug == pSlug)
                     for (plugin::Model* m : p->models)
                         if (m->slug == mSlug) { model = m; break; }
             if (!model) return toolFail("Model not found: " + pSlug + "/" + mSlug);
+            if (x < 0.f) return toolFail("x is required. Call vcvrack_get_rack_layout first and use a suggested_positions entry.");
             int64_t moduleId = -1;
-            taskQueue->post([this, rackApp, model, x, y, nearId, &moduleId]() mutable {
+            float finalX = 0.f, finalY = 0.f, finalW = 0.f;
+            taskQueue->post([rackApp, model, x, y, &moduleId, &finalX, &finalY, &finalW]() mutable {
                 if (!rackApp->engine || !rackApp->scene || !rackApp->scene->rack) return;
                 engine::Module* m = model->createModule();
                 if (!m) return;
@@ -575,18 +780,18 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                 app::ModuleWidget* mw = model->createModuleWidget(m);
                 if (!mw) return;
                 rackApp->scene->rack->addModule(mw);
-                math::Vec pos;
-                if (x >= 0.f) {
-                    pos = math::Vec(x, y >= 0.f ? y : 0.f);
-                } else {
-                    pos = computeAutoPosition(nearId);
-                }
-                rackApp->scene->rack->setModulePosForce(mw, pos);
-            }).get();
+                rackApp->scene->rack->setModulePosForce(mw, math::Vec(x, y >= 0.f ? y : 0.f));
+                finalX = mw->box.pos.x;
+                finalY = mw->box.pos.y;
+                finalW = mw->box.size.x;
+            }, "add_module/" + pSlug + "/" + mSlug).get();
             if (moduleId < 0) return toolFail("Failed to create module");
-            return toolOk("{\"id\":" + std::to_string(moduleId) +
-                          ",\"plugin\":" + jsonStr(pSlug) +
-                          ",\"slug\":" + jsonStr(mSlug) + "}");
+            return toolOk("{\"id\":" + std::to_string(moduleId)
+                        + ",\"plugin\":" + jsonStr(pSlug)
+                        + ",\"slug\":" + jsonStr(mSlug)
+                        + ",\"x\":" + std::to_string((int)finalX)
+                        + ",\"y\":" + std::to_string((int)finalY)
+                        + ",\"width\":" + std::to_string((int)finalW) + "}");
         }
 
         if (name == "vcvrack_delete_module") {
@@ -613,7 +818,7 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                     if (i < (int)mod->params.size() - 1) body += ",";
                 }
                 body += "]";
-            }).get();
+            }, "get_params/" + std::to_string(id)).get();
             if (body.empty()) return toolFail("Module not found: " + std::to_string(id));
             return toolOk(body);
         }
@@ -642,7 +847,7 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                     }
                     pos = end + 1;
                 }
-            }).get();
+            }, "set_params/" + std::to_string(id)).get();
             if (!found) return toolFail("Module not found: " + std::to_string(id));
             return toolOk("{\"applied\":" + std::to_string(applied) + "}");
         }
@@ -665,7 +870,7 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                     if (i < ids.size() - 1) body += ",";
                 }
                 body += "]";
-            }).get();
+            }, "list_cables").get();
             return toolOk(body);
         }
 
@@ -697,7 +902,7 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                 cw->outputPort = oPort;
                 cw->inputPort = iPort;
                 rackApp->scene->rack->addCable(cw);
-            }).get();
+            }, "add_cable/" + std::to_string(outM) + "→" + std::to_string(inM)).get();
             if (cableId < 0) return toolFail("Failed to connect: ports or modules not found");
             return toolOk("{\"id\":" + std::to_string(cableId) + "}");
         }
@@ -716,14 +921,14 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                     engine::Cable* c = rackApp->engine->getCable(id);
                     if (c) { found = true; rackApp->engine->removeCable(c); delete c; }
                 }
-            }).get();
+            }, "delete_cable/" + std::to_string(id)).get();
             if (!found) return toolFail("Cable not found: " + std::to_string(id));
             return toolOk("{\"removed\":true}");
         }
 
         if (name == "vcvrack_get_sample_rate") {
             float sr = 0.f;
-            taskQueue->post([rackApp, &sr]() { sr = rackApp->engine->getSampleRate(); }).get();
+            taskQueue->post([rackApp, &sr]() { sr = rackApp->engine->getSampleRate(); }, "get_sample_rate").get();
             return toolOk("{\"sampleRate\":" + std::to_string(sr) + "}");
         }
 
@@ -771,20 +976,6 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
             for (plugin::Plugin* p : rack::plugin::plugins)
                 if (p->slug == slug) return toolOk(serializePlugin(p));
             return toolFail("Plugin not found: " + slug);
-        }
-
-        if (name == "vcvrack_save_patch") {
-            std::string path = parseJsonString(args, "path");
-            if (path.empty()) return toolFail("Missing 'path'");
-            taskQueue->post([rackApp, path]() { if (rackApp && rackApp->patch) rackApp->patch->save(path); }).get();
-            return toolOk("{\"saved\":" + jsonStr(path) + "}");
-        }
-
-        if (name == "vcvrack_load_patch") {
-            std::string path = parseJsonString(args, "path");
-            if (path.empty()) return toolFail("Missing 'path'");
-            taskQueue->post([rackApp, path]() { if (rackApp && rackApp->patch) rackApp->patch->load(path); }).get();
-            return toolOk("{\"loaded\":" + jsonStr(path) + "}");
         }
 
         return toolFail("Unknown tool: " + name);
@@ -888,6 +1079,16 @@ void RackHttpServer::setupRoutes() {
             res.set_content(ok(body), "application/json");
         });
 
+        svr.Get("/mcp-module/position", [rackApp, this](const httplib::Request&, httplib::Response& res) {
+            if (!rackApp || !rackApp->engine) { res.status = 503; res.set_content(err("Engine not available"), "application/json"); return; }
+            std::string body;
+            int64_t mcpId = parent ? parent->id : -1;
+            taskQueue->post([rackApp, &body, mcpId]() {
+                body = getMcpModulePositionJson(rackApp && rackApp->scene ? rackApp->scene->rack : nullptr, mcpId);
+            }).get();
+            res.set_content(ok(body), "application/json");
+        });
+
         svr.Get("/modules", [rackApp, this](const httplib::Request&, httplib::Response& res) {
             if (!rackApp || !rackApp->engine) { res.status = 503; res.set_content(err("Engine not available"), "application/json"); return; }
             std::string body;
@@ -901,6 +1102,112 @@ void RackHttpServer::setupRoutes() {
                 }
                 body += "]";
             }).get();
+            res.set_content(ok(body), "application/json");
+        });
+
+        svr.Get("/rack/layout", [rackApp, this](const httplib::Request&, httplib::Response& res) {
+            if (!rackApp || !rackApp->engine) { res.status = 503; res.set_content(err("Engine not available"), "application/json"); return; }
+
+            struct RowInfo { float y; float left; float right; int count; };
+            std::map<int, RowInfo> rows;
+            std::map<int, float> rowTerminalOutputX;
+            float mcpX = 0.f, mcpY = 0.f;
+            int64_t mcpId = parent ? parent->id : -1;
+
+            taskQueue->post([rackApp, &rows, &rowTerminalOutputX, &mcpX, &mcpY, mcpId]() {
+                for (int64_t id : rackApp->engine->getModuleIds()) {
+                    app::ModuleWidget* mw = rackApp->scene->rack->getModule(id);
+                    if (!mw) continue;
+                    if (id == mcpId) { mcpX = mw->box.pos.x; mcpY = mw->box.pos.y; }
+                    int rowIdx = (int)std::round(mw->box.pos.y / RACK_GRID_HEIGHT);
+                    float rowY  = rowIdx * RACK_GRID_HEIGHT;
+                    float right = mw->box.pos.x + mw->box.size.x;
+                    if (isTerminalOutputModule(mw)) {
+                        auto outIt = rowTerminalOutputX.find(rowIdx);
+                        if (outIt == rowTerminalOutputX.end() || mw->box.pos.x < outIt->second) {
+                            rowTerminalOutputX[rowIdx] = mw->box.pos.x;
+                        }
+                    }
+                    auto it = rows.find(rowIdx);
+                    if (it == rows.end()) {
+                        rows[rowIdx] = {rowY, mw->box.pos.x, right, 1};
+                    } else {
+                        it->second.left  = std::min(it->second.left,  mw->box.pos.x);
+                        it->second.right = std::max(it->second.right, right);
+                        it->second.count++;
+                    }
+                }
+            }).get();
+
+            // Build rows JSON
+            std::string rowsJson = "[";
+            bool first = true;
+            for (auto& [idx, r] : rows) {
+                if (!first) rowsJson += ",";
+                rowsJson += "{";
+                rowsJson += jsonKV("row",          std::to_string(idx));
+                rowsJson += jsonKV("y",            std::to_string((int)r.y));
+                rowsJson += jsonKV("left_edge",    std::to_string((int)r.left));
+                rowsJson += jsonKV("right_edge",   std::to_string((int)r.right));
+                rowsJson += jsonKV("module_count", std::to_string(r.count), true);
+                rowsJson += "}";
+                first = false;
+            }
+            rowsJson += "]";
+
+            // Build suggested_positions JSON
+            std::string sugJson = "[";
+            bool sfirst = true;
+            int mcpRowIdx = (int)std::round(mcpY / RACK_GRID_HEIGHT);
+            for (auto& [idx, r] : rows) {
+                if (!sfirst) sugJson += ",";
+                sugJson += "{";
+                sugJson += jsonKVs("label",       "append_row_" + std::to_string(idx));
+                sugJson += jsonKVs("description", "Append to row " + std::to_string(idx) + " (y=" + std::to_string((int)r.y) + ", " + std::to_string(r.count) + " modules)");
+                sugJson += jsonKV("x",            std::to_string((int)r.right));
+                sugJson += jsonKV("y",            std::to_string((int)r.y), true);
+                sugJson += "}";
+                sfirst = false;
+            }
+            auto mcpRowIt = rows.find(mcpRowIdx);
+            if (mcpRowIt != rows.end()) {
+                if (!sfirst) sugJson += ",";
+                sugJson += "{";
+                sugJson += jsonKVs("label",       "append_mcp_row");
+                sugJson += jsonKVs("description", "Append directly to the row containing the MCP module (recommended for related modules)");
+                sugJson += jsonKV("x",            std::to_string((int)mcpRowIt->second.right));
+                sugJson += jsonKV("y",            std::to_string((int)mcpRowIt->second.y), true);
+                sugJson += "}";
+                sfirst = false;
+                auto outIt = rowTerminalOutputX.find(mcpRowIdx);
+                if (outIt != rowTerminalOutputX.end()) {
+                    if (!sfirst) sugJson += ",";
+                    sugJson += "{";
+                    sugJson += jsonKVs("label",       "insert_before_output");
+                    sugJson += jsonKVs("description", "Insert before the terminal output module on the MCP row so Audio stays at the far right");
+                    sugJson += jsonKV("x",            std::to_string((int)outIt->second));
+                    sugJson += jsonKV("y",            std::to_string((int)mcpRowIt->second.y), true);
+                    sugJson += "}";
+                    sfirst = false;
+                }
+            }
+            // Always offer a new-row option below all existing content, aligned with the MCP module
+            int newRowIdx = rows.empty() ? 0 : (rows.rbegin()->first + 1);
+            int newRowY   = newRowIdx * (int)RACK_GRID_HEIGHT;
+            if (!sfirst) sugJson += ",";
+            sugJson += "{";
+            sugJson += jsonKVs("label",       "new_row");
+            sugJson += jsonKVs("description", "Start a fresh row below all existing modules, horizontally aligned with the MCP module");
+            sugJson += jsonKV("x",            std::to_string((int)mcpX));
+            sugJson += jsonKV("y",            std::to_string(newRowY), true);
+            sugJson += "}";
+            sugJson += "]";
+
+            std::string mcpJson = "{" + jsonKV("x", std::to_string((int)mcpX))
+                               + jsonKV("y", std::to_string((int)mcpY), true) + "}";
+            std::string body = "{\"grid_unit_px\":15,\"row_height_px\":380,\"mcp_module\":" + mcpJson
+                             + ",\"rows\":" + rowsJson
+                             + ",\"suggested_positions\":" + sugJson + "}";
             res.set_content(ok(body), "application/json");
         });
 
@@ -1134,23 +1441,6 @@ void RackHttpServer::setupRoutes() {
             res.status = 404; res.set_content(err("Plugin not found"), "application/json");
         });
 
-        svr.Post("/patch/save", [rackApp, this](const httplib::Request& req, httplib::Response& res) {
-            if (!rackApp || !rackApp->patch) { res.status = 503; res.set_content(err("Engine not available"), "application/json"); return; }
-            std::string path = parseJsonString(req.body, "path");
-            if (path.empty()) { res.status = 400; res.set_content(err("Missing path"), "application/json"); return; }
-            taskQueue->post([rackApp, path]() { if (rackApp && rackApp->patch) rackApp->patch->save(path); }).get();
-
-            res.set_content(ok("{\"saved\":" + jsonStr(path) + "}"), "application/json");
-        });
-
-        svr.Post("/patch/load", [rackApp, this](const httplib::Request& req, httplib::Response& res) {
-            if (!rackApp || !rackApp->patch) { res.status = 503; res.set_content(err("Engine not available"), "application/json"); return; }
-            std::string path = parseJsonString(req.body, "path");
-            if (path.empty()) { res.status = 400; res.set_content(err("Missing path"), "application/json"); return; }
-            taskQueue->post([rackApp, path]() { if (rackApp->patch) rackApp->patch->load(path); }).get();
-            res.set_content(ok("{\"loaded\":" + jsonStr(path) + "}"), "application/json");
-        });
-
         // ── MCP Streamable HTTP transport (protocol version 2024-11-05) ─────
         // POST /mcp  – JSON-RPC 2.0 requests (initialize / tools/list / tools/call)
         svr.Post("/mcp", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1191,8 +1481,27 @@ void RackHttpServer::stop() {
 }
 
 RackMcpServer::~RackMcpServer() { stopServer(); }
-void RackMcpServer::startServer(int port) { stopServer(); server = new RackHttpServer(); server->port = port; server->taskQueue = &taskQueue; server->parent = this; server->start(); lights[RUNNING_LIGHT].setBrightness(1.f); }
-void RackMcpServer::stopServer() { if (server) { server->stop(); delete server; server = nullptr; } lights[RUNNING_LIGHT].setBrightness(0.f); }
+void RackMcpServer::startServer(int port) {
+    INFO("[RackMcpServer] startServer: port=%d", port);
+    stopServer();
+    server = new RackHttpServer();
+    server->port = port;
+    server->taskQueue = &taskQueue;
+    server->parent = this;
+    server->start();
+    lights[RUNNING_LIGHT].setBrightness(1.f);
+    INFO("[RackMcpServer] startServer: server running");
+}
+void RackMcpServer::stopServer() {
+    if (server) {
+        INFO("[RackMcpServer] stopServer: stopping HTTP server");
+        server->stop();
+        delete server;
+        server = nullptr;
+        INFO("[RackMcpServer] stopServer: done");
+    }
+    lights[RUNNING_LIGHT].setBrightness(0.f);
+}
 
 // ─── Port text field ──────────────────────────────────────────────────────
 
@@ -1332,6 +1641,7 @@ RackMcpServerWidget::RackMcpServerWidget(RackMcpServer* module) {
         // Heartbeat output — re-centered in shifted CLOCK card (108–122.5 mm)
         addOutput(createOutputCentered<PJ301MPort>(
             mm2px(Vec(15.24f, 115.25f)), module, RackMcpServer::HEARTBEAT_OUTPUT));
+
 }
 
 void RackMcpServerWidget::step() {
@@ -1355,6 +1665,12 @@ void RackMcpServerWidget::step() {
                 }
             }
         }
+    }
+    {
+        std::lock_guard<std::mutex> lk(m->taskQueue.mutex);
+        size_t pending = m->taskQueue.tasks.size();
+        if (pending > 0)
+            INFO("[RackMcpServer] step: draining %zu pending task(s)", pending);
     }
     m->taskQueue.drain();
 }

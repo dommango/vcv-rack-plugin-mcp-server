@@ -7,11 +7,13 @@ Usage:
 
 Commands:
   status                              Server status and patch info
+  mcp-position                        MCP Server module root position
   sample-rate                         Engine sample rate
+  layout                              Rack spatial map — call before every add
   library [plugin_slug]               List installed plugins/modules
   modules                             List modules in current patch
   module <id>                         Detail for one module
-  add <plugin_slug> <module_slug> [x y]  Add a module
+  add <plugin_slug> <module_slug> <x> <y>  Add a module at explicit position
   remove <id>                         Remove a module
   params <id>                         Get parameter metadata and current raw values for a module
   set-param <id> <param_id> <value> [<param_id> <value> ...]  Set params (prefer small batches after inspecting params)
@@ -22,6 +24,13 @@ Commands:
   load <path>                         Load a patch
 
 Notes:
+  - Always call `layout` before adding modules. Use the returned `suggested_positions`
+    to pick explicit x y coordinates for each `add`. Never rely on auto-placement.
+  - Prefer `append_mcp_row` for modules that belong with the main patch section.
+    If the row already ends with `Audio 2`/other output modules, prefer
+    `insert_before_output` so outputs remain at the far right.
+  - When adding several modules in a row, compute the next x as: x + width (returned
+    by each `add` response) — no need to call `layout` again between each add.
   - Always run `params <id>` before `set-param` so you can use the module's real
     min/max range, displayValue, and options instead of guessing from the name.
   - Many Rack controls use normalized raw values rather than literal Hz/seconds.
@@ -81,6 +90,12 @@ def main():
     elif cmd == "sample-rate":
         pretty(request("GET", f"{base}/sample-rate"))
 
+    elif cmd == "mcp-position":
+        pretty(request("GET", f"{base}/mcp-module/position"))
+
+    elif cmd == "layout":
+        pretty(request("GET", f"{base}/rack/layout"))
+
     # ── Library ────────────────────────────────────────────────────────────
     elif cmd == "library":
         if a:
@@ -98,12 +113,12 @@ def main():
         pretty(request("GET", f"{base}/modules/{a[0]}"))
 
     elif cmd == "add":
-        if len(a) < 2:
-            parser.error("add requires <plugin_slug> <module_slug> [x y]")
-        body = {"plugin": a[0], "slug": a[1]}
-        if len(a) >= 4:
-            body["x"] = float(a[2])
-            body["y"] = float(a[3])
+        if len(a) < 4:
+            parser.error(
+                "add requires <plugin_slug> <module_slug> <x> <y>\n"
+                "  Run `layout` first to get the correct x y coordinates."
+            )
+        body = {"plugin": a[0], "slug": a[1], "x": float(a[2]), "y": float(a[3])}
         pretty(request("POST", f"{base}/modules/add", body))
 
     elif cmd == "remove":
