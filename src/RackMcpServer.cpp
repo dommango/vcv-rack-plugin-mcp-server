@@ -1736,8 +1736,8 @@ void PanelLabelWidget::draw(const DrawArgs& args) {
     drawCard(args, 4.8f, 39.f, 20.9f, 12.0f);
 
     drawDivider(args, mm2px(57.f));
-    drawLabel(args, mm2px(15.25f), mm2px(62.f), "POWER", 7.2f, label, NVG_ALIGN_CENTER);
-    drawCard(args, 4.8f, 65.f, 20.9f, 12.5f);
+    drawLabel(args, mm2px(15.24f), mm2px(60.f), "POWER", 7.2f, label, NVG_ALIGN_CENTER);
+    drawCard(args, 4.8f, 63.f, 20.9f, 12.5f);
 
     drawDivider(args, mm2px(78.f));
     drawLabel(args, left, mm2px(81.f), "STATUS", 7.2f, label, NVG_ALIGN_LEFT);
@@ -1836,7 +1836,7 @@ RackMcpServerWidget::RackMcpServerWidget(RackMcpServer* module) {
 
         // Sticky enable switch
         addParam(createParamCentered<CKSS>(
-            mm2px(Vec(15.6f, 71.25f)), module, RackMcpServer::ENABLED_PARAM));
+            mm2px(Vec(15.24f, 69.25f)), module, RackMcpServer::ENABLED_PARAM));
 
         // STATUS: online LED (green) — left column
         addChild(createLightCentered<MediumLight<GreenLight>>(
