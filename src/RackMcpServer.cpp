@@ -17,6 +17,8 @@
 
 #include <sstream>
 #include <cstring>
+#include <functional>
+#include <set>
 
 using namespace rack;
 
@@ -369,12 +371,58 @@ static bool isTerminalOutputModule(const app::ModuleWidget* mw) {
     return false;
 }
 
+struct LayoutPrefs {
+    int colsHp = 0;
+    int rows = 0;
+};
+
+struct RowInfo {
+    float y = 0.f;
+    float left = 0.f;
+    float right = 0.f;
+    int count = 0;
+};
+
+static LayoutPrefs readLayoutPrefs(const RackMcpServer* parent) {
+    if (!parent) return {};
+    std::lock_guard<std::mutex> lock(const_cast<RackMcpServer*>(parent)->layoutPrefsMutex);
+    LayoutPrefs prefs;
+    prefs.colsHp = std::max(0, parent->layoutMatrixColsHp);
+    prefs.rows = std::max(0, parent->layoutMatrixRows);
+    return prefs;
+}
+
+static int roundRowIndex(float y) {
+    return (int)std::round(y / RACK_GRID_HEIGHT);
+}
+
+static int alignedRowY(int rowIdx) {
+    return rowIdx * (int)RACK_GRID_HEIGHT;
+}
+
+static int hpToPx(int hp) {
+    return hp * (int)RACK_GRID_WIDTH;
+}
+
+static bool isWithinRowBounds(int rowIdx, int mcpRowIdx, const LayoutPrefs& prefs) {
+    if (prefs.rows <= 0) return true;
+    return rowIdx >= mcpRowIdx && rowIdx < (mcpRowIdx + prefs.rows);
+}
+
+static bool isWithinColBounds(float x, float width, float mcpX, const LayoutPrefs& prefs) {
+    if (prefs.colsHp <= 0) return true;
+    float maxXExclusive = mcpX + (float)hpToPx(prefs.colsHp);
+    return x >= mcpX && (x + std::max(0.f, width)) <= maxXExclusive;
+}
+
 // ─── MCP tools list (JSON Schema for each tool) ────────────────────────────
 
 static const char* MCP_TOOLS_JSON = R"json([
 {"name":"vcvrack_get_status","description":"Get VCV Rack server status: version, sample rate, and loaded module count.","inputSchema":{"type":"object","properties":{}}},
 {"name":"vcvrack_get_mcp_position","description":"Get the MCP Server module's root position in rack pixel coordinates. Use this as the starting anchor before placing related modules.","inputSchema":{"type":"object","properties":{}}},
-{"name":"vcvrack_get_rack_layout","description":"Get a spatial map of the rack: all rows, their occupied x ranges, the MCP module position, and ready-to-use suggested_positions for placing new modules. ALWAYS call this before vcvrack_add_module to get explicit x/y coordinates. Never rely on auto-placement.\n\nResponse fields:\n- grid_unit_px: 1 HP = 15 px (standard VCV Rack unit)\n- row_height_px: 380 px per row (one 3U row)\n- mcp_module: the MCP Server module's current x/y position. Use this as the anchor when deciding whether to extend the MCP row or start a new aligned row.\n- rows[]: each row has y (top of row), left_edge, right_edge (first free x in that row), module_count\n- suggested_positions[]: pre-computed insertion points. Each entry has label, description, x, y. Prefer 'append_mcp_row' for modules that belong with the main MCP section, and prefer 'insert_before_output' when the row already ends with Audio Interface modules so outputs stay on the far right.\n\nBatching: when adding several modules to the same row, compute the next x yourself as: next_x = previous_x + width_returned_by_add. This avoids calling layout again between each add.","inputSchema":{"type":"object","properties":{}}},
+{"name":"vcvrack_get_layout_preferences","description":"Get user matrix preferences anchored at the MCP module. matrix_cols_hp is width in HP (15 px/HP) from MCP x, matrix_rows is row count starting at MCP row. 0 means unbounded.","inputSchema":{"type":"object","properties":{}}},
+{"name":"vcvrack_set_layout_preferences","description":"Set user matrix preferences anchored at the MCP module. matrix_cols_hp is width in HP (15 px/HP) from MCP x, matrix_rows is row count starting at MCP row. Set either to 0 for unbounded.","inputSchema":{"type":"object","properties":{"matrix_cols_hp":{"type":"integer","minimum":0},"matrix_rows":{"type":"integer","minimum":0}},"required":["matrix_cols_hp","matrix_rows"]}},
+{"name":"vcvrack_get_rack_layout","description":"Get a spatial map of the rack: all rows, their occupied x ranges, the MCP module position, current matrix_preferences, and ready-to-use suggested_positions for placing new modules. ALWAYS call this before vcvrack_add_module to get explicit x/y coordinates. Never rely on auto-placement.\n\nResponse fields:\n- grid_unit_px: 1 HP = 15 px (standard VCV Rack unit)\n- row_height_px: 380 px per row (one 3U row)\n- mcp_module: the MCP Server module's current x/y position. MCP is always the world anchor.\n- matrix_preferences: user-defined bounds relative to MCP anchor.\n- rows[]: each row has y (top of row), left_edge, right_edge (first free x in that row), module_count\n- suggested_positions[]: insertion points constrained by matrix_preferences. Prefer 'append_mcp_row' for modules that belong with the main MCP section, and prefer 'insert_before_output' when the row already ends with Audio Interface modules so outputs stay on the far right.\n\nBatching: when adding several modules to the same row, compute the next x yourself as: next_x = previous_x + width_returned_by_add. This avoids calling layout again between each add.","inputSchema":{"type":"object","properties":{}}},
 {"name":"vcvrack_list_modules","description":"List all modules currently loaded in the VCV Rack patch. Each entry includes id, plugin, slug, name, param/input/output counts, x position, y position, and width (in pixels). Use x + width to compute where the next module should go in the same row.","inputSchema":{"type":"object","properties":{}}},
 {"name":"vcvrack_get_module","description":"Get detailed information about a specific module: all parameters (with value ranges), inputs, and outputs.","inputSchema":{"type":"object","properties":{"id":{"type":"integer","description":"Module ID"}},"required":["id"]}},
 {"name":"vcvrack_add_module","description":"Add a new module to the VCV Rack patch at an explicit pixel position.\n\nMANDATORY PLACEMENT WORKFLOW — follow this every time:\n1. Call vcvrack_get_rack_layout to get mcp_module, rows, and suggested_positions.\n2. Use mcp_module as your spatial anchor to decide whether the module belongs on the MCP row, another existing row, or a new aligned row.\n3. Prefer 'append_mcp_row' for modules related to the main patch section. If the row already ends with Audio Interface modules, prefer 'insert_before_output' so Audio stays at the far right.\n4. Pass the chosen x and y values here. Both x and y are required.\n5. The response includes the new module's width. Store it: next_x = x + width for the following module in the same row.\n\nNever omit x/y. Never auto-place. Consistent explicit positioning keeps the rack readable.\n\nUse vcvrack_search_library to discover valid plugin/slug values before adding.","inputSchema":{"type":"object","properties":{"plugin":{"type":"string","description":"Plugin slug (e.g. 'Fundamental')"},"slug":{"type":"string","description":"Module slug (e.g. 'VCO-1')"},"x":{"type":"number","description":"X position in pixels — obtain from vcvrack_get_rack_layout suggested_positions, or compute as previous_x + previous_width"},"y":{"type":"number","description":"Y position in pixels — obtain from vcvrack_get_rack_layout suggested_positions (e.g. 0 for row 0, 380 for row 1)"}},"required":["plugin","slug","x","y"]}},
@@ -448,28 +496,29 @@ static std::string buildPromptMessages(const std::string& name, const std::strin
             "3. Call vcvrack_search_library to find all required modules (VCO, VCF, VCA, ADSR, Audio, etc.).\n"
             "   Collect plugin slug and module slug for every module you plan to add.\n\n"
             "PLACEMENT — always do this before any vcvrack_add_module call\n"
-            "4. Call vcvrack_get_rack_layout once. Inspect mcp_module, rows, and suggested_positions:\n"
+            "4. Call vcvrack_get_layout_preferences first and respect those bounds for all placements.\n"
+            "5. Call vcvrack_get_rack_layout once. Inspect mcp_module, matrix_preferences, rows, and suggested_positions:\n"
             "   - Use mcp_module as the anchor for deciding where this section belongs.\n"
             "   - Prefer 'append_mcp_row' if the modules belong near the MCP root module.\n"
             "   - If the MCP row already ends with Audio Interface modules, prefer 'insert_before_output' so Audio remains the terminal module.\n"
             "   - If the patch should extend the MCP row or another existing row, use that row's 'append_row_N'.\n"
             "   - Use 'new_row' only if starting a logically separate section aligned with mcp_module.x.\n"
             "   Note: grid_unit_px=15 (1 HP), row_height_px=380 (one 3U row).\n"
-            "5. Call vcvrack_add_module for each required module, passing x and y from step 4.\n"
+            "6. Call vcvrack_add_module for each required module, passing x and y from step 5.\n"
             "   After each add, store the returned width. Compute the next module's x as:\n"
             "     next_x = current_x + returned_width\n"
             "   This lets you add a whole row of modules without calling vcvrack_get_rack_layout again.\n"
             "   Save every returned module ID — you will need them for cables and params.\n\n"
             "WIRING\n"
-            "6. Call vcvrack_get_module on each module to discover input/output port indices and their labels.\n"
-            "7. Call vcvrack_add_cable to wire the signal path (e.g. VCO OUT -> VCF IN -> VCA IN -> Audio IN).\n"
+            "7. Call vcvrack_get_module on each module to discover input/output port indices and their labels.\n"
+            "8. Call vcvrack_add_cable to wire the signal path (e.g. VCO OUT -> VCF IN -> VCA IN -> Audio IN).\n"
             "   Verify each cable with vcvrack_list_cables if unsure.\n\n"
             "TUNING\n"
-            "8. Call vcvrack_get_params before every tuning step to read each control's raw range,\n"
+            "9. Call vcvrack_get_params before every tuning step to read each control's raw range,\n"
             "   display string, and switch labels. Never guess units from the parameter name alone.\n"
-            "9. Use vcvrack_set_params in small batches, keeping values inside the reported min/max range.\n"
+            "10. Use vcvrack_set_params in small batches, keeping values inside the reported min/max range.\n"
             "   Many Rack knobs are normalized control values, not literal Hz or seconds.\n"
-            "10. After each write, call vcvrack_get_params again to confirm the change before continuing.\n\n"
+            "11. After each write, call vcvrack_get_params again to confirm the change before continuing.\n\n"
             "FINISHING\n"
             "Always verify each step's result before proceeding to the next.";
         return "[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":" + jsonStr(text) + "}}]";
@@ -510,7 +559,8 @@ static std::string buildPromptMessages(const std::string& name, const std::strin
             "MANDATORY PLACEMENT WORKFLOW — follow exactly:\n\n"
             "1. Call vcvrack_get_mcp_position.\n"
             "   Use the returned x/y as the root anchor for the patch section you are extending.\n\n"
-            "2. Call vcvrack_get_rack_layout.\n"
+            "2. Call vcvrack_get_layout_preferences and keep all positions inside those bounds.\n"
+            "3. Call vcvrack_get_rack_layout.\n"
             "   Read the response carefully:\n"
             "   - 'mcp_module' gives the MCP Server module's x/y position. Use it as the anchor for layout decisions.\n"
             "   - 'rows' shows every occupied row with its y coordinate, left/right edges, and module count.\n"
@@ -520,19 +570,19 @@ static std::string buildPromptMessages(const std::string& name, const std::strin
             "       'append_row_N' — place next to existing modules in row N.\n"
             "       'new_row'      — start a completely new row below all current content, aligned with mcp_module.x.\n"
             "   - grid_unit_px=15 means 1 HP = 15 px. row_height_px=380 means one 3U row = 380 px.\n\n"
-            "3. Choose the right suggested position:\n"
+            "4. Choose the right suggested position:\n"
             "   - First decide which row the module group belongs on relative to mcp_module.\n"
             "   - If the module belongs with the MCP root section, prefer 'append_mcp_row'.\n"
             "   - If the row already ends with Audio Interface modules and you are extending the signal chain, prefer 'insert_before_output'.\n"
             "   - If it should extend an existing row, use that row's 'append_row_N'.\n"
             "   - If it should start a new, independent signal chain, use 'new_row'.\n\n"
-            "4. Call vcvrack_add_module for the first module with the chosen x and y.\n"
+            "5. Call vcvrack_add_module for the first module with the chosen x and y.\n"
             "   The response includes the module's 'width' in pixels.\n\n"
-            "5. For each subsequent module in the same row, compute:\n"
+            "6. For each subsequent module in the same row, compute:\n"
             "     next_x = previous_x + previous_width\n"
             "   Call vcvrack_add_module with next_x and the same y.\n"
             "   Do NOT call vcvrack_get_rack_layout again between modules in the same row.\n\n"
-            "6. Save every returned module ID for wiring and parameter configuration.\n\n"
+            "7. Save every returned module ID for wiring and parameter configuration.\n\n"
             "Never omit x and y. Never rely on auto-placement. Explicit coordinates keep the rack tidy.";
         return "[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":" + jsonStr(text) + "}}]";
     }
@@ -573,47 +623,197 @@ void RackMcpServer::process(const ProcessArgs& args) {
 
 json_t* RackMcpServer::dataToJson() {
     json_t* rootJ = json_object();
+    int colsHp = 0;
+    int rows = 0;
+    {
+        std::lock_guard<std::mutex> lock(layoutPrefsMutex);
+        colsHp = layoutMatrixColsHp;
+        rows = layoutMatrixRows;
+    }
     json_object_set_new(rootJ, "enabled", json_boolean(wasEnabled));
+    json_object_set_new(rootJ, "layout_matrix_cols_hp", json_integer(colsHp));
+    json_object_set_new(rootJ, "layout_matrix_rows", json_integer(rows));
     return rootJ;
 }
 
 void RackMcpServer::dataFromJson(json_t* rootJ) {
     json_t* enabledJ = json_object_get(rootJ, "enabled");
     if (enabledJ) params[ENABLED_PARAM].setValue(json_boolean_value(enabledJ) ? 1.f : 0.f);
+    json_t* colsJ = json_object_get(rootJ, "layout_matrix_cols_hp");
+    json_t* rowsJ = json_object_get(rootJ, "layout_matrix_rows");
+    std::lock_guard<std::mutex> lock(layoutPrefsMutex);
+    layoutMatrixColsHp = colsJ ? std::max(0, (int)json_integer_value(colsJ)) : 8;
+    layoutMatrixRows = rowsJ ? std::max(0, (int)json_integer_value(rowsJ)) : 4;
 }
 
 // ─── HTTP Server ───────────────────────────────────────────────────────────
 
 RackHttpServer::~RackHttpServer() { stop(); }
 
-rack::math::Vec RackHttpServer::computeAutoPosition(int64_t nearModuleId) {
+rack::math::Vec RackHttpServer::computeAutoPosition(int64_t nearModuleId, float moduleWidth) {
     if (!rackApp || !rackApp->scene || !rackApp->scene->rack) return math::Vec(0, 0);
     app::RackWidget* rw = rackApp->scene->rack;
 
+    app::ModuleWidget* bridge = parent ? rw->getModule(parent->id) : nullptr;
+    float anchorX = bridge ? bridge->box.pos.x : 0.f;
+    float anchorY = bridge ? bridge->box.pos.y : 0.f;
+    int mcpRowIdx = roundRowIndex(anchorY);
+    LayoutPrefs prefs = readLayoutPrefs(parent);
+
+    auto valid = [&](float x, float y) {
+        int rowIdx = roundRowIndex(y);
+        return isWithinRowBounds(rowIdx, mcpRowIdx, prefs)
+            && isWithinColBounds(x, moduleWidth, anchorX, prefs);
+    };
+
     if (nearModuleId >= 0) {
         app::ModuleWidget* fw = rw->getModule(nearModuleId);
-        if (fw) return math::Vec(fw->box.pos.x + fw->box.size.x, fw->box.pos.y);
-    }
-
-    app::ModuleWidget* bridge = parent ? rw->getModule(parent->id) : nullptr;
-    float anchorX = bridge ? (bridge->box.pos.x + bridge->box.size.x) : 0.f;
-    float anchorY = bridge ? bridge->box.pos.y : 0.f;
-    float rowHalfH = bridge ? (bridge->box.size.y * 0.6f) : 380.f;
-
-    float bestX = anchorX;
-    float bestY = anchorY;
-    for (app::ModuleWidget* w : rw->getModules()) {
-        if (bridge && w == bridge) continue;
-        float wCenterY = w->box.pos.y + w->box.size.y * 0.5f;
-        float anchorCenterY = anchorY + (bridge ? bridge->box.size.y * 0.5f : rowHalfH);
-        if (std::abs(wCenterY - anchorCenterY) < rowHalfH) {
-            float r = w->box.pos.x + w->box.size.x;
-            if (r > bestX) { bestX = r; bestY = w->box.pos.y; }
+        if (fw) {
+            math::Vec nearPos = math::Vec(fw->box.pos.x + fw->box.size.x, fw->box.pos.y);
+            if (valid(nearPos.x, nearPos.y)) return nearPos;
         }
     }
-    return math::Vec(bestX, bestY);
+
+    std::map<int, float> rowRight;
+    for (app::ModuleWidget* w : rw->getModules()) {
+        if (bridge && w == bridge) continue;
+        int rowIdx = roundRowIndex(w->box.pos.y);
+        if (!isWithinRowBounds(rowIdx, mcpRowIdx, prefs)) continue;
+        float right = w->box.pos.x + w->box.size.x;
+        rowRight[rowIdx] = std::max(rowRight[rowIdx], right);
+    }
+
+    int maxKnownRowIdx = mcpRowIdx;
+    for (const auto& [rowIdx, _] : rowRight) {
+        maxKnownRowIdx = std::max(maxKnownRowIdx, rowIdx);
+    }
+    int maxRowIdx = (prefs.rows > 0) ? (mcpRowIdx + prefs.rows - 1) : (maxKnownRowIdx + 1);
+    for (int rowIdx = mcpRowIdx; rowIdx <= maxRowIdx; ++rowIdx) {
+        float candidateX = anchorX;
+        auto it = rowRight.find(rowIdx);
+        if (it != rowRight.end()) {
+            candidateX = std::max(anchorX, it->second);
+        }
+        float candidateY = (float)alignedRowY(rowIdx);
+        if (valid(candidateX, candidateY)) {
+            return math::Vec(candidateX, candidateY);
+        }
+    }
+
+    // Signal exhaustion with a negative position.
+    return math::Vec(-1.f, -1.f);
 }
 
+std::string RackHttpServer::getLayoutPrefsJson() {
+    LayoutPrefs prefs = readLayoutPrefs(parent);
+    return "{"
+        + jsonKV("matrix_cols_hp", std::to_string(prefs.colsHp))
+        + jsonKV("matrix_rows", std::to_string(prefs.rows))
+        + jsonKVs("anchor", "mcp_module", true)
+        + "}";
+}
+
+static bool resolveBoundedSuggestion(float requestedX, int requestedRowIdx, float mcpX, int mcpRowIdx,
+                                     const LayoutPrefs& prefs, const std::map<int, RowInfo>& rows, int& outRowIdx, float& outX) {
+    if (!isWithinRowBounds(requestedRowIdx, mcpRowIdx, prefs)) return false;
+    outRowIdx = requestedRowIdx;
+    outX = std::max(requestedX, mcpX);
+    if (isWithinColBounds(outX, 0.f, mcpX, prefs)) return true;
+
+    int wrappedRow = requestedRowIdx + 1;
+    if (!isWithinRowBounds(wrappedRow, mcpRowIdx, prefs)) return false;
+    outRowIdx = wrappedRow;
+    auto wrapIt = rows.find(wrappedRow);
+    outX = mcpX;
+    if (wrapIt != rows.end()) outX = std::max(mcpX, wrapIt->second.right);
+    return isWithinColBounds(outX, 0.f, mcpX, prefs);
+}
+
+static void addSuggestion(std::string& sugJson, bool& sfirst, const std::string& label, const std::string& desc,
+                          float x, int rowIdx, float mcpX, const LayoutPrefs& prefs) {
+    if (!sfirst) sugJson += ",";
+    sugJson += "{";
+    sugJson += jsonKVs("label", label);
+    sugJson += jsonKVs("description", desc);
+    sugJson += jsonKV("x", std::to_string((int)x));
+    sugJson += jsonKV("y", std::to_string(alignedRowY(rowIdx)));
+    if (prefs.colsHp > 0) {
+        int remaining = std::max(0, (int)(mcpX + hpToPx(prefs.colsHp) - x));
+        sugJson += jsonKV("remaining_width_px", std::to_string(remaining), true);
+    } else {
+        sugJson += jsonKV("remaining_width_px", "-1", true);
+    }
+    sugJson += "}";
+    sfirst = false;
+}
+
+static std::string buildLayoutJson(const std::map<int, RowInfo>& rows, const std::map<int, float>& rowTerminalOutputX,
+                                   float mcpX, float mcpY, const LayoutPrefs& prefs) {
+    std::string rowsJson = "[";
+    bool first = true;
+    for (auto& [idx, r] : rows) {
+        if (!first) rowsJson += ",";
+        rowsJson += "{" + jsonKV("row", std::to_string(idx))
+                  + jsonKV("y", std::to_string((int)r.y))
+                  + jsonKV("left_edge", std::to_string((int)r.left))
+                  + jsonKV("right_edge", std::to_string((int)r.right))
+                  + jsonKV("module_count", std::to_string(r.count), true) + "}";
+        first = false;
+    }
+    rowsJson += "]";
+
+    std::string sugJson = "[";
+    bool sfirst = true;
+    int mcpRowIdx = roundRowIndex(mcpY);
+    std::set<std::pair<int, int>> seen;
+
+    auto addCandidate = [&](const std::string& label, const std::string& desc, float reqX, int reqRow) {
+        int rowIdx = reqRow;
+        float x = reqX;
+        if (!resolveBoundedSuggestion(reqX, reqRow, mcpX, mcpRowIdx, prefs, rows, rowIdx, x)) return;
+        std::pair<int, int> key((int)x, rowIdx);
+        if (seen.count(key)) return;
+        seen.insert(key);
+        addSuggestion(sugJson, sfirst, label, desc, x, rowIdx, mcpX, prefs);
+    };
+
+    for (auto& [idx, r] : rows) {
+        addCandidate("append_row_" + std::to_string(idx),
+                     "Append to row " + std::to_string(idx) + " (y=" + std::to_string((int)r.y) + ", " + std::to_string(r.count) + " modules)",
+                     r.right, idx);
+    }
+
+    auto mcpRowIt = rows.find(mcpRowIdx);
+    if (mcpRowIt != rows.end()) {
+        addCandidate("append_mcp_row",
+                     "Append directly to the row containing the MCP module (recommended for related modules)",
+                     mcpRowIt->second.right, mcpRowIdx);
+        auto outIt = rowTerminalOutputX.find(mcpRowIdx);
+        if (outIt != rowTerminalOutputX.end()) {
+            addCandidate("insert_before_output",
+                         "Insert before the terminal output module on the MCP row so Audio stays at the far right",
+                         outIt->second, mcpRowIdx);
+        }
+    }
+
+    int newRowIdx = rows.empty() ? mcpRowIdx : (rows.rbegin()->first + 1);
+    addCandidate("new_row",
+                 "Start a fresh row below all existing modules, horizontally aligned with the MCP module",
+                 mcpX, newRowIdx);
+
+    sugJson += "]";
+    std::string mcpJson = "{" + jsonKV("x", std::to_string((int)mcpX))
+                       + jsonKV("y", std::to_string((int)mcpY), true) + "}";
+    std::string prefsJson = "{"
+        + jsonKV("matrix_cols_hp", std::to_string(prefs.colsHp))
+        + jsonKV("matrix_rows", std::to_string(prefs.rows))
+        + jsonKVs("anchor", "mcp_module", true)
+        + "}";
+    return "{\"grid_unit_px\":15,\"row_height_px\":380,\"mcp_module\":" + mcpJson
+         + ",\"matrix_preferences\":" + prefsJson
+         + ",\"rows\":" + rowsJson
+         + ",\"suggested_positions\":" + sugJson + "}";
+}
 // ─── MCP tool dispatcher ────────────────────────────────────────────────
 
 std::string RackHttpServer::dispatchTool(const std::string& name, const std::string& args) {
@@ -639,6 +839,24 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                 body = getMcpModulePositionJson(rackApp && rackApp->scene ? rackApp->scene->rack : nullptr, mcpId);
             }, "get_mcp_position").get();
             return toolOk(body);
+        }
+
+        if (name == "vcvrack_get_layout_preferences") {
+            return toolOk(getLayoutPrefsJson());
+        }
+
+        if (name == "vcvrack_set_layout_preferences") {
+            int colsHp = (int)parseJsonDouble(args, "matrix_cols_hp", -1);
+            int rows = (int)parseJsonDouble(args, "matrix_rows", -1);
+            if (colsHp < 0 || rows < 0) {
+                return toolFail("matrix_cols_hp and matrix_rows are required and must be >= 0");
+            }
+            if (parent) {
+                std::lock_guard<std::mutex> lock(parent->layoutPrefsMutex);
+                parent->layoutMatrixColsHp = colsHp;
+                parent->layoutMatrixRows = rows;
+            }
+            return toolOk(getLayoutPrefsJson());
         }
 
         if (name == "vcvrack_list_modules") {
@@ -671,10 +889,10 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
         }
 
         if (name == "vcvrack_get_rack_layout") {
-            struct RowInfo { float y; float left; float right; int count; };
             std::map<int, RowInfo> rows;
             std::map<int, float> rowTerminalOutputX;
             float mcpX = 0.f, mcpY = 0.f;
+            LayoutPrefs prefs = readLayoutPrefs(parent);
             int64_t mcpId = parent ? parent->id : -1;
             taskQueue->post([rackApp, &rows, &rowTerminalOutputX, &mcpX, &mcpY, mcpId]() {
                 if (!rackApp || !rackApp->engine) return;
@@ -701,60 +919,7 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                     }
                 }
             }, "get_rack_layout").get();
-            std::string rowsJson = "[";
-            bool first = true;
-            for (auto& [idx, r] : rows) {
-                if (!first) rowsJson += ",";
-                rowsJson += "{" + jsonKV("row", std::to_string(idx))
-                          + jsonKV("y",            std::to_string((int)r.y))
-                          + jsonKV("left_edge",    std::to_string((int)r.left))
-                          + jsonKV("right_edge",   std::to_string((int)r.right))
-                          + jsonKV("module_count", std::to_string(r.count), true) + "}";
-                first = false;
-            }
-            rowsJson += "]";
-            std::string sugJson = "[";
-            bool sfirst = true;
-            int mcpRowIdx = (int)std::round(mcpY / RACK_GRID_HEIGHT);
-            for (auto& [idx, r] : rows) {
-                if (!sfirst) sugJson += ",";
-                sugJson += "{" + jsonKVs("label", "append_row_" + std::to_string(idx))
-                         + jsonKVs("description", "Append to row " + std::to_string(idx) + " (y=" + std::to_string((int)r.y) + ", " + std::to_string(r.count) + " modules)")
-                         + jsonKV("x", std::to_string((int)r.right))
-                         + jsonKV("y", std::to_string((int)r.y), true) + "}";
-                sfirst = false;
-            }
-            auto mcpRowIt = rows.find(mcpRowIdx);
-            if (mcpRowIt != rows.end()) {
-                if (!sfirst) sugJson += ",";
-                sugJson += "{" + jsonKVs("label", "append_mcp_row")
-                         + jsonKVs("description", "Append directly to the row containing the MCP module (recommended for related modules)")
-                         + jsonKV("x", std::to_string((int)mcpRowIt->second.right))
-                         + jsonKV("y", std::to_string((int)mcpRowIt->second.y), true) + "}";
-                sfirst = false;
-                auto outIt = rowTerminalOutputX.find(mcpRowIdx);
-                if (outIt != rowTerminalOutputX.end()) {
-                    if (!sfirst) sugJson += ",";
-                    sugJson += "{" + jsonKVs("label", "insert_before_output")
-                             + jsonKVs("description", "Insert before the terminal output module on the MCP row so Audio stays at the far right")
-                             + jsonKV("x", std::to_string((int)outIt->second))
-                             + jsonKV("y", std::to_string((int)mcpRowIt->second.y), true) + "}";
-                    sfirst = false;
-                }
-            }
-            int newRowIdx = rows.empty() ? 0 : (rows.rbegin()->first + 1);
-            int newRowY   = newRowIdx * (int)RACK_GRID_HEIGHT;
-            if (!sfirst) sugJson += ",";
-            sugJson += "{" + jsonKVs("label", "new_row")
-                     + jsonKVs("description", "Start a fresh row below all existing modules, horizontally aligned with the MCP module")
-                     + jsonKV("x", std::to_string((int)mcpX))
-                     + jsonKV("y", std::to_string(newRowY), true) + "}";
-            sugJson += "]";
-            std::string mcpJson = "{" + jsonKV("x", std::to_string((int)mcpX))
-                               + jsonKV("y", std::to_string((int)mcpY), true) + "}";
-            return toolOk("{\"grid_unit_px\":15,\"row_height_px\":380,\"mcp_module\":" + mcpJson
-                        + ",\"rows\":" + rowsJson
-                        + ",\"suggested_positions\":" + sugJson + "}");
+            return toolOk(buildLayoutJson(rows, rowTerminalOutputX, mcpX, mcpY, prefs));
         }
 
         if (name == "vcvrack_add_module") {
@@ -769,23 +934,35 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                         if (m->slug == mSlug) { model = m; break; }
             if (!model) return toolFail("Model not found: " + pSlug + "/" + mSlug);
             if (x < 0.f) return toolFail("x is required. Call vcvrack_get_rack_layout first and use a suggested_positions entry.");
+            if (y < 0.f) return toolFail("y is required. Call vcvrack_get_rack_layout first and use a suggested_positions entry.");
             int64_t moduleId = -1;
             float finalX = 0.f, finalY = 0.f, finalW = 0.f;
-            taskQueue->post([rackApp, model, x, y, &moduleId, &finalX, &finalY, &finalW]() mutable {
+            LayoutPrefs prefs = readLayoutPrefs(parent);
+            int64_t mcpId = parent ? parent->id : -1;
+            taskQueue->post([rackApp, model, x, y, prefs, mcpId, &moduleId, &finalX, &finalY, &finalW]() mutable {
                 if (!rackApp->engine || !rackApp->scene || !rackApp->scene->rack) return;
                 engine::Module* m = model->createModule();
                 if (!m) return;
+                app::ModuleWidget* mw = model->createModuleWidget(m);
+                if (!mw) { delete m; return; }
+                app::ModuleWidget* mcp = rackApp->scene->rack->getModule(mcpId);
+                float mcpX = mcp ? mcp->box.pos.x : 0.f;
+                int mcpRowIdx = roundRowIndex(mcp ? mcp->box.pos.y : 0.f);
+                int rowIdx = roundRowIndex(y);
+                if (!isWithinRowBounds(rowIdx, mcpRowIdx, prefs) || !isWithinColBounds(x, mw->box.size.x, mcpX, prefs)) {
+                    delete mw;
+                    delete m;
+                    return;
+                }
                 rackApp->engine->addModule(m);
                 moduleId = m->id;
-                app::ModuleWidget* mw = model->createModuleWidget(m);
-                if (!mw) return;
                 rackApp->scene->rack->addModule(mw);
-                rackApp->scene->rack->setModulePosForce(mw, math::Vec(x, y >= 0.f ? y : 0.f));
+                rackApp->scene->rack->setModulePosForce(mw, math::Vec(x, y));
                 finalX = mw->box.pos.x;
                 finalY = mw->box.pos.y;
                 finalW = mw->box.size.x;
             }, "add_module/" + pSlug + "/" + mSlug).get();
-            if (moduleId < 0) return toolFail("Failed to create module");
+            if (moduleId < 0 || finalW <= 0.f) return toolFail("Failed to create module (outside matrix preferences or invalid model)");
             return toolOk("{\"id\":" + std::to_string(moduleId)
                         + ",\"plugin\":" + jsonStr(pSlug)
                         + ",\"slug\":" + jsonStr(mSlug)
@@ -1089,6 +1266,26 @@ void RackHttpServer::setupRoutes() {
             res.set_content(ok(body), "application/json");
         });
 
+        svr.Get("/layout/preferences", [this](const httplib::Request&, httplib::Response& res) {
+            res.set_content(ok(getLayoutPrefsJson()), "application/json");
+        });
+
+        svr.Post("/layout/preferences", [this](const httplib::Request& req, httplib::Response& res) {
+            int colsHp = (int)parseJsonDouble(req.body, "matrix_cols_hp", -1);
+            int rows = (int)parseJsonDouble(req.body, "matrix_rows", -1);
+            if (colsHp < 0 || rows < 0) {
+                res.status = 400;
+                res.set_content(err("matrix_cols_hp and matrix_rows are required and must be >= 0"), "application/json");
+                return;
+            }
+            if (parent) {
+                std::lock_guard<std::mutex> lock(parent->layoutPrefsMutex);
+                parent->layoutMatrixColsHp = colsHp;
+                parent->layoutMatrixRows = rows;
+            }
+            res.set_content(ok(getLayoutPrefsJson()), "application/json");
+        });
+
         svr.Get("/modules", [rackApp, this](const httplib::Request&, httplib::Response& res) {
             if (!rackApp || !rackApp->engine) { res.status = 503; res.set_content(err("Engine not available"), "application/json"); return; }
             std::string body;
@@ -1108,10 +1305,10 @@ void RackHttpServer::setupRoutes() {
         svr.Get("/rack/layout", [rackApp, this](const httplib::Request&, httplib::Response& res) {
             if (!rackApp || !rackApp->engine) { res.status = 503; res.set_content(err("Engine not available"), "application/json"); return; }
 
-            struct RowInfo { float y; float left; float right; int count; };
             std::map<int, RowInfo> rows;
             std::map<int, float> rowTerminalOutputX;
             float mcpX = 0.f, mcpY = 0.f;
+            LayoutPrefs prefs = readLayoutPrefs(parent);
             int64_t mcpId = parent ? parent->id : -1;
 
             taskQueue->post([rackApp, &rows, &rowTerminalOutputX, &mcpX, &mcpY, mcpId]() {
@@ -1139,75 +1336,7 @@ void RackHttpServer::setupRoutes() {
                 }
             }).get();
 
-            // Build rows JSON
-            std::string rowsJson = "[";
-            bool first = true;
-            for (auto& [idx, r] : rows) {
-                if (!first) rowsJson += ",";
-                rowsJson += "{";
-                rowsJson += jsonKV("row",          std::to_string(idx));
-                rowsJson += jsonKV("y",            std::to_string((int)r.y));
-                rowsJson += jsonKV("left_edge",    std::to_string((int)r.left));
-                rowsJson += jsonKV("right_edge",   std::to_string((int)r.right));
-                rowsJson += jsonKV("module_count", std::to_string(r.count), true);
-                rowsJson += "}";
-                first = false;
-            }
-            rowsJson += "]";
-
-            // Build suggested_positions JSON
-            std::string sugJson = "[";
-            bool sfirst = true;
-            int mcpRowIdx = (int)std::round(mcpY / RACK_GRID_HEIGHT);
-            for (auto& [idx, r] : rows) {
-                if (!sfirst) sugJson += ",";
-                sugJson += "{";
-                sugJson += jsonKVs("label",       "append_row_" + std::to_string(idx));
-                sugJson += jsonKVs("description", "Append to row " + std::to_string(idx) + " (y=" + std::to_string((int)r.y) + ", " + std::to_string(r.count) + " modules)");
-                sugJson += jsonKV("x",            std::to_string((int)r.right));
-                sugJson += jsonKV("y",            std::to_string((int)r.y), true);
-                sugJson += "}";
-                sfirst = false;
-            }
-            auto mcpRowIt = rows.find(mcpRowIdx);
-            if (mcpRowIt != rows.end()) {
-                if (!sfirst) sugJson += ",";
-                sugJson += "{";
-                sugJson += jsonKVs("label",       "append_mcp_row");
-                sugJson += jsonKVs("description", "Append directly to the row containing the MCP module (recommended for related modules)");
-                sugJson += jsonKV("x",            std::to_string((int)mcpRowIt->second.right));
-                sugJson += jsonKV("y",            std::to_string((int)mcpRowIt->second.y), true);
-                sugJson += "}";
-                sfirst = false;
-                auto outIt = rowTerminalOutputX.find(mcpRowIdx);
-                if (outIt != rowTerminalOutputX.end()) {
-                    if (!sfirst) sugJson += ",";
-                    sugJson += "{";
-                    sugJson += jsonKVs("label",       "insert_before_output");
-                    sugJson += jsonKVs("description", "Insert before the terminal output module on the MCP row so Audio stays at the far right");
-                    sugJson += jsonKV("x",            std::to_string((int)outIt->second));
-                    sugJson += jsonKV("y",            std::to_string((int)mcpRowIt->second.y), true);
-                    sugJson += "}";
-                    sfirst = false;
-                }
-            }
-            // Always offer a new-row option below all existing content, aligned with the MCP module
-            int newRowIdx = rows.empty() ? 0 : (rows.rbegin()->first + 1);
-            int newRowY   = newRowIdx * (int)RACK_GRID_HEIGHT;
-            if (!sfirst) sugJson += ",";
-            sugJson += "{";
-            sugJson += jsonKVs("label",       "new_row");
-            sugJson += jsonKVs("description", "Start a fresh row below all existing modules, horizontally aligned with the MCP module");
-            sugJson += jsonKV("x",            std::to_string((int)mcpX));
-            sugJson += jsonKV("y",            std::to_string(newRowY), true);
-            sugJson += "}";
-            sugJson += "]";
-
-            std::string mcpJson = "{" + jsonKV("x", std::to_string((int)mcpX))
-                               + jsonKV("y", std::to_string((int)mcpY), true) + "}";
-            std::string body = "{\"grid_unit_px\":15,\"row_height_px\":380,\"mcp_module\":" + mcpJson
-                             + ",\"rows\":" + rowsJson
-                             + ",\"suggested_positions\":" + sugJson + "}";
+            std::string body = buildLayoutJson(rows, rowTerminalOutputX, mcpX, mcpY, prefs);
             res.set_content(ok(body), "application/json");
         });
 
@@ -1233,21 +1362,44 @@ void RackHttpServer::setupRoutes() {
             for (plugin::Plugin* p : rack::plugin::plugins) if (p->slug == pSlug) for (plugin::Model* m : p->models) if (m->slug == mSlug) { model = m; break; }
             if (!model) { res.status = 404; res.set_content(err("Model not found"), "application/json"); return; }
             int64_t moduleId = -1;
-            taskQueue->post([this, rackApp, model, x, y, nearId, &moduleId]() mutable {
+            std::string failReason;
+            LayoutPrefs prefs = readLayoutPrefs(parent);
+            int64_t mcpId = parent ? parent->id : -1;
+            taskQueue->post([this, rackApp, model, x, y, nearId, prefs, mcpId, &moduleId, &failReason]() mutable {
                 if (!rackApp->engine || !rackApp->scene || !rackApp->scene->rack) return;
                 engine::Module* m = model->createModule(); if (!m) return;
-                rackApp->engine->addModule(m); moduleId = m->id;
-                app::ModuleWidget* mw = model->createModuleWidget(m); if (!mw) return;
-                rackApp->scene->rack->addModule(mw);
+                app::ModuleWidget* mw = model->createModuleWidget(m); if (!mw) { delete m; return; }
                 math::Vec pos;
                 if (x >= 0.f) {
-                    pos = math::Vec(x, y >= 0.f ? y : 0.f);
+                    if (y < 0.f) { failReason = "y is required when x is provided"; delete mw; delete m; return; }
+                    pos = math::Vec(x, y);
                 } else {
-                    pos = computeAutoPosition(nearId);
+                    pos = computeAutoPosition(nearId, mw->box.size.x);
                 }
+                app::ModuleWidget* mcp = rackApp->scene->rack->getModule(mcpId);
+                float mcpX = mcp ? mcp->box.pos.x : 0.f;
+                int mcpRowIdx = roundRowIndex(mcp ? mcp->box.pos.y : 0.f);
+                int rowIdx = roundRowIndex(pos.y);
+                if (pos.x < 0.f || pos.y < 0.f) {
+                    failReason = "No valid matrix slot available for auto-placement";
+                    delete mw;
+                    delete m;
+                    return;
+                }
+                if (!isWithinRowBounds(rowIdx, mcpRowIdx, prefs) || !isWithinColBounds(pos.x, mw->box.size.x, mcpX, prefs)) {
+                    failReason = "Requested placement is outside matrix preferences";
+                    delete mw;
+                    delete m;
+                    return;
+                }
+                rackApp->engine->addModule(m); moduleId = m->id;
+                rackApp->scene->rack->addModule(mw);
                 rackApp->scene->rack->setModulePosForce(mw, pos);
             }).get();
-            if (moduleId < 0) { res.status = 500; res.set_content(err("Failed to create module"), "application/json"); }
+            if (moduleId < 0) {
+                res.status = 400;
+                res.set_content(err(failReason.empty() ? "Failed to create module" : failReason), "application/json");
+            }
             else res.set_content(ok("{" + jsonKV("id", std::to_string(moduleId)) + jsonKVs("plugin", pSlug) + jsonKVs("slug", mSlug, true) + "}"), "application/json");
         });
 
@@ -1584,7 +1736,7 @@ void PanelLabelWidget::draw(const DrawArgs& args) {
     drawCard(args, 4.8f, 39.f, 20.9f, 12.0f);
 
     drawDivider(args, mm2px(57.f));
-    drawLabel(args, left, mm2px(62.f), "POWER", 7.2f, label, NVG_ALIGN_LEFT);
+    drawLabel(args, mm2px(15.25f), mm2px(62.f), "POWER", 7.2f, label, NVG_ALIGN_CENTER);
     drawCard(args, 4.8f, 65.f, 20.9f, 12.5f);
 
     drawDivider(args, mm2px(78.f));
@@ -1601,6 +1753,62 @@ void PanelLabelWidget::draw(const DrawArgs& args) {
 }
 
 // ─── Widget ───────────────────────────────────────────────────────────────
+
+enum class MatrixTarget {
+    Columns,
+    Rows
+};
+
+struct MatrixTextField : TextField {
+    RackMcpServer* module = nullptr;
+    MatrixTarget target = MatrixTarget::Columns;
+
+    void step() override {
+        TextField::step();
+        if (!module) return;
+        if (APP->event->getSelectedWidget() != this) {
+            int value = 0;
+            {
+                std::lock_guard<std::mutex> lock(module->layoutPrefsMutex);
+                value = (target == MatrixTarget::Columns) ? module->layoutMatrixColsHp : module->layoutMatrixRows;
+            }
+            std::string s = std::to_string(value);
+            if (text != s) setText(s);
+        }
+    }
+
+    void onSelectKey(const SelectKeyEvent& e) override {
+        TextField::onSelectKey(e);
+        if (!module) return;
+        if (e.action == GLFW_PRESS && (e.key == GLFW_KEY_ENTER || e.key == GLFW_KEY_KP_ENTER)) {
+            int value = std::max(0, std::atoi(text.c_str()));
+            std::lock_guard<std::mutex> lock(module->layoutPrefsMutex);
+            if (target == MatrixTarget::Columns) module->layoutMatrixColsHp = value;
+            else module->layoutMatrixRows = value;
+            APP->event->setSelectedWidget(nullptr);
+        }
+    }
+};
+
+struct MatrixEditItem : MenuItem {
+    RackMcpServer* module = nullptr;
+    MatrixTarget target = MatrixTarget::Columns;
+
+    Menu* createChildMenu() override {
+        Menu* menu = new Menu;
+        auto* field = createWidget<MatrixTextField>(Vec(0, 0));
+        field->box.size.x = 140.f;
+        field->module = module;
+        field->target = target;
+        {
+            std::lock_guard<std::mutex> lock(module->layoutPrefsMutex);
+            int value = (target == MatrixTarget::Columns) ? module->layoutMatrixColsHp : module->layoutMatrixRows;
+            field->setText(std::to_string(value));
+        }
+        menu->addChild(field);
+        return menu;
+    }
+};
 
 RackMcpServerWidget::RackMcpServerWidget(RackMcpServer* module) {
         setModule(module);
@@ -1628,7 +1836,7 @@ RackMcpServerWidget::RackMcpServerWidget(RackMcpServer* module) {
 
         // Sticky enable switch
         addParam(createParamCentered<CKSS>(
-            mm2px(Vec(15.24, 71.25f)), module, RackMcpServer::ENABLED_PARAM));
+            mm2px(Vec(15.6f, 71.25f)), module, RackMcpServer::ENABLED_PARAM));
 
         // STATUS: online LED (green) — left column
         addChild(createLightCentered<MediumLight<GreenLight>>(
@@ -1673,6 +1881,35 @@ void RackMcpServerWidget::step() {
             INFO("[RackMcpServer] step: draining %zu pending task(s)", pending);
     }
     m->taskQueue.drain();
+}
+
+void RackMcpServerWidget::appendContextMenu(Menu* menu) {
+    ModuleWidget::appendContextMenu(menu);
+    RackMcpServer* m = getModule<RackMcpServer>();
+    if (!m) return;
+
+    menu->addChild(new MenuSeparator());
+    menu->addChild(createMenuLabel("Matrix (MCP Anchor)"));
+
+    auto editCols = new MatrixEditItem();
+    editCols->text = "Columns";
+    editCols->rightText = RIGHT_ARROW;
+    editCols->module = m;
+    editCols->target = MatrixTarget::Columns;
+    menu->addChild(editCols);
+
+    auto editRows = new MatrixEditItem();
+    editRows->text = "Rows";
+    editRows->rightText = RIGHT_ARROW;
+    editRows->module = m;
+    editRows->target = MatrixTarget::Rows;
+    menu->addChild(editRows);
+
+    auto unboundedHint = new MenuItem();
+    unboundedHint->text = "0 = unbounded";
+    unboundedHint->disabled = true;
+    menu->addChild(unboundedHint);
+
 }
 
 Model* modelRackMcpServer = createModel<RackMcpServer, RackMcpServerWidget>("RackMcpServer");

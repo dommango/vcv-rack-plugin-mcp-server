@@ -47,8 +47,8 @@ struct RackMcpServer : Module {
     // User-configurable layout bounds, anchored from the MCP module position.
     // cols_hp/rows set to 0 mean "unbounded".
     std::mutex layoutPrefsMutex;
-    int layoutMatrixColsHp = 0;
-    int layoutMatrixRows = 0;
+    int layoutMatrixColsHp = 8;
+    int layoutMatrixRows = 4;
 
     RackMcpServer();
     ~RackMcpServer() override;
@@ -74,7 +74,7 @@ public:
     ~RackHttpServer();
 
     std::string getLayoutPrefsJson();
-    rack::math::Vec computeAutoPosition(int64_t nearModuleId = -1);
+    rack::math::Vec computeAutoPosition(int64_t nearModuleId = -1, float moduleWidth = 0.f);
     std::string dispatchTool(const std::string& name, const std::string& args);
     void handleMcpPost(const httplib::Request& req, httplib::Response& res);
     void setupRoutes();
@@ -103,4 +103,5 @@ struct RackMcpServerWidget : ModuleWidget {
 
     explicit RackMcpServerWidget(RackMcpServer* module);
     void step() override;
+    void appendContextMenu(Menu* menu) override;
 };
