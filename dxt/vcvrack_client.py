@@ -20,8 +20,8 @@ Commands:
   cables                              List all cables
   connect <out_mod_id> <out_port_id> <in_mod_id> <in_port_id>  Connect ports
   disconnect <cable_id>               Remove a cable
-  save <path>                         Save current patch
-  load <path>                         Load a patch
+  layout-prefs                        Get matrix layout preferences
+  set-layout-prefs <cols_hp> <rows>   Set matrix layout preferences (0 = unbounded)
 
 Notes:
   - Always call `layout` before adding modules. Use the returned `suggested_positions`
@@ -211,16 +211,15 @@ def main():
             parser.error("disconnect requires <cable_id>")
         pretty(request("DELETE", f"{base}/cables/{a[0]}"))
 
-    # ── Patch ──────────────────────────────────────────────────────────────
-    elif cmd == "save":
-        if not a:
-            parser.error("save requires <path>")
-        pretty(request("POST", f"{base}/patch/save", {"path": a[0]}))
+    # ── Layout preferences ─────────────────────────────────────────────────
+    elif cmd == "layout-prefs":
+        pretty(request("GET", f"{base}/layout/preferences"))
 
-    elif cmd == "load":
-        if not a:
-            parser.error("load requires <path>")
-        pretty(request("POST", f"{base}/patch/load", {"path": a[0]}))
+    elif cmd == "set-layout-prefs":
+        if len(a) < 2:
+            parser.error("set-layout-prefs requires <cols_hp> <rows>")
+        body = {"matrix_cols_hp": int(a[0]), "matrix_rows": int(a[1])}
+        pretty(request("POST", f"{base}/layout/preferences", body))
 
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)

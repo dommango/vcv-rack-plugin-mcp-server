@@ -29,3 +29,4 @@ CMakeUserPresets.json
 .claude/
 .cache/
 patches/
+vcvrack-mcp-server.mcpb
