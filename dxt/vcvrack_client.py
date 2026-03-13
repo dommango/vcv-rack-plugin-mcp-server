@@ -68,6 +68,47 @@ def pretty(obj):
     print(json.dumps(obj, indent=2))
 
 
+def run_mcp_server(port):
+    """
+    stdio ↔ HTTP bridge for Claude Desktop.
+    Reads newline-delimited JSON-RPC from stdin, forwards each message to
+    POST http://127.0.0.1:<port>/mcp, and writes compact single-line JSON
+    responses back to stdout (NDJSON framing required by Claude Desktop).
+    """
+    url = f"http://127.0.0.1:{port}/mcp"
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+            # Notifications have no "id" — fire-and-forget, no response expected.
+            if "id" not in msg:
+                continue
+            payload = line.encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode("utf-8").strip()
+            if not body:
+                continue
+            compact = json.dumps(json.loads(body), separators=(",", ":"))
+            sys.stdout.write(compact + "\n")
+            sys.stdout.flush()
+        except urllib.error.URLError as e:
+            error = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32603, "message": f"VCV Rack unreachable: {e}"},
+            }
+            sys.stdout.write(json.dumps(error, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="VCV Rack MCP Server CLI client",
@@ -75,9 +116,19 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("--port", type=int, default=2600, help="Server port (default: 2600)")
-    parser.add_argument("command", help="Command to run")
+    parser.add_argument("--mcp-server", action="store_true",
+                        help="Run as stdio MCP bridge for Claude Desktop")
+    parser.add_argument("command", nargs="?", help="Command to run")
     parser.add_argument("args", nargs="*", help="Command arguments")
     args = parser.parse_args()
+
+    if args.mcp_server:
+        run_mcp_server(args.port)
+        return
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
 
     base = f"http://127.0.0.1:{args.port}"
     cmd = args.command

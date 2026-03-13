@@ -433,7 +433,7 @@ static const char* MCP_TOOLS_JSON = R"json([
 {"name":"vcvrack_add_cable","description":"Connect an output port to an input port with a patch cable.","inputSchema":{"type":"object","properties":{"outputModuleId":{"type":"integer","description":"Source module ID"},"outputId":{"type":"integer","description":"Output port index (0-based)"},"inputModuleId":{"type":"integer","description":"Destination module ID"},"inputId":{"type":"integer","description":"Input port index (0-based)"}},"required":["outputModuleId","outputId","inputModuleId","inputId"]}},
 {"name":"vcvrack_delete_cable","description":"Remove a cable connection by cable ID.","inputSchema":{"type":"object","properties":{"id":{"type":"integer","description":"Cable ID"}},"required":["id"]}},
 {"name":"vcvrack_get_sample_rate","description":"Get the current audio engine sample rate in Hz.","inputSchema":{"type":"object","properties":{}}},
-{"name":"vcvrack_search_library","description":"Search the installed plugin library for modules by name, slug, or tag. Use this to discover plugin slugs and module slugs before calling vcvrack_add_module.","inputSchema":{"type":"object","properties":{"q":{"type":"string","description":"Search query matching slug, name, or description"},"tags":{"type":"string","description":"Tag filter e.g. 'VCO', 'VCF', 'LFO', 'Envelope', 'Mixer'"}},"required":[]}},
+{"name":"vcvrack_search_library","description":"Search the installed plugin library for modules. Two modes:\n1. Single search: pass 'q' and/or 'tags'.\n2. Multi-search: pass 'queries' array to find VCO, VCF, VCA, ADSR, Audio etc. in ONE call. Each entry is keyed by its 'label' in the response. Always prefer multi-search when building a patch.","inputSchema":{"type":"object","properties":{"q":{"type":"string","description":"Search query matching slug, name, or description (single search)"},"tags":{"type":"string","description":"Tag filter e.g. 'VCO', 'VCF', 'LFO', 'Envelope', 'Mixer' (single search)"},"queries":{"type":"array","description":"Multi-search: array of independent queries returned grouped by label. Use to find all needed module types in one call.","items":{"type":"object","properties":{"label":{"type":"string","description":"Key for these results in the response e.g. 'vco', 'vca'"},"q":{"type":"string","description":"Search query"},"tags":{"type":"string","description":"Tag filter e.g. 'VCO', 'VCF'"}},"required":["label"]}}},"required":[]}},
 {"name":"vcvrack_get_plugin","description":"Get detailed information about an installed plugin and its full module list.","inputSchema":{"type":"object","properties":{"slug":{"type":"string","description":"Plugin slug"}},"required":["slug"]}}
 ])json";
 
@@ -950,6 +950,7 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
                 int mcpRowIdx = roundRowIndex(mcp ? mcp->box.pos.y : 0.f);
                 int rowIdx = roundRowIndex(y);
                 if (!isWithinRowBounds(rowIdx, mcpRowIdx, prefs) || !isWithinColBounds(x, mw->box.size.x, mcpX, prefs)) {
+                    mw->module = nullptr; // detach before delete so ~ModuleWidget() doesn't call engine->removeModule on unregistered module
                     delete mw;
                     delete m;
                     return;
@@ -1110,42 +1111,85 @@ std::string RackHttpServer::dispatchTool(const std::string& name, const std::str
         }
 
         if (name == "vcvrack_search_library") {
-            std::string tagFilter = parseJsonString(args, "tags");
-            std::string query = parseJsonString(args, "q");
-            std::string queryLow = query;
-            std::transform(queryLow.begin(), queryLow.end(), queryLow.begin(), ::tolower);
-            std::string body = "[";
-            bool firstPlugin = true;
-            for (plugin::Plugin* plug : rack::plugin::plugins) {
-                std::vector<plugin::Model*> filtered;
-                for (plugin::Model* m : plug->models) {
-                    if (!tagFilter.empty()) {
-                        bool hasTag = false;
-                        for (int t : m->tagIds) {
-                            std::string tn = rack::tag::getTag(t);
-                            std::transform(tn.begin(), tn.end(), tn.begin(), ::tolower);
-                            if (tagFilter.find(tn) != std::string::npos) { hasTag = true; break; }
+            // Core search: given a tag-filter string and a query string, returns a
+            // JSON array of { slug, name, modules[] } plugin objects.
+            auto runSearch = [&](const std::string& tagFilter, const std::string& query) -> std::string {
+                std::string qLow = query;
+                std::transform(qLow.begin(), qLow.end(), qLow.begin(), ::tolower);
+                std::string tagLow = tagFilter;
+                std::transform(tagLow.begin(), tagLow.end(), tagLow.begin(), ::tolower);
+                std::string out = "[";
+                bool firstPlug = true;
+                for (plugin::Plugin* plug : rack::plugin::plugins) {
+                    std::vector<plugin::Model*> filtered;
+                    for (plugin::Model* m : plug->models) {
+                        if (!tagLow.empty()) {
+                            bool hasTag = false;
+                            for (int t : m->tagIds) {
+                                std::string tn = rack::tag::getTag(t);
+                                std::transform(tn.begin(), tn.end(), tn.begin(), ::tolower);
+                                if (tagLow.find(tn) != std::string::npos) { hasTag = true; break; }
+                            }
+                            if (!hasTag) continue;
                         }
-                        if (!hasTag) continue;
+                        if (!qLow.empty()) {
+                            std::string s = m->slug + " " + m->name + " " + m->description;
+                            std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+                            if (s.find(qLow) == std::string::npos) continue;
+                        }
+                        filtered.push_back(m);
                     }
-                    if (!queryLow.empty()) {
-                        std::string s = m->slug + " " + m->name + " " + m->description;
-                        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-                        if (s.find(queryLow) == std::string::npos) continue;
+                    if (filtered.empty()) continue;
+                    if (!firstPlug) out += ","; firstPlug = false;
+                    out += "{\"slug\":" + jsonStr(plug->slug) + ",\"name\":" + jsonStr(plug->name) + ",\"modules\":[";
+                    for (size_t i = 0; i < filtered.size(); i++) {
+                        out += serializeModel(filtered[i]);
+                        if (i < filtered.size() - 1) out += ",";
                     }
-                    filtered.push_back(m);
+                    out += "]}";
                 }
-                if (filtered.empty()) continue;
-                if (!firstPlugin) body += ","; firstPlugin = false;
-                body += "{\"slug\":" + jsonStr(plug->slug) + ",\"name\":" + jsonStr(plug->name) + ",\"modules\":[";
-                for (size_t i = 0; i < filtered.size(); i++) {
-                    body += serializeModel(filtered[i]);
-                    if (i < filtered.size() - 1) body += ",";
+                out += "]";
+                return out;
+            };
+
+            // Multi-search mode: queries array present
+            std::string queriesRaw = parseRawValue(args, "queries");
+            if (!queriesRaw.empty() && queriesRaw[0] == '[') {
+                // Iterate array items (each is a JSON object)
+                std::string result = "{";
+                bool firstEntry = true;
+                size_t pos = 0;
+                // Skip opening '['
+                while (pos < queriesRaw.size() && queriesRaw[pos] != '{') pos++;
+                while (pos < queriesRaw.size()) {
+                    if (queriesRaw[pos] != '{') { pos++; continue; }
+                    // Find matching '}'
+                    int depth = 0;
+                    bool inStr = false;
+                    size_t start = pos;
+                    for (; pos < queriesRaw.size(); pos++) {
+                        char ch = queriesRaw[pos];
+                        if (ch == '\\') { pos++; continue; }
+                        if (ch == '"') { inStr = !inStr; continue; }
+                        if (inStr) continue;
+                        if (ch == '{') depth++;
+                        else if (ch == '}' && --depth == 0) { pos++; break; }
+                    }
+                    std::string item = queriesRaw.substr(start, pos - start);
+                    std::string label = parseJsonString(item, "label");
+                    std::string itemQ = parseJsonString(item, "q");
+                    std::string itemTags = parseJsonString(item, "tags");
+                    if (!label.empty()) {
+                        if (!firstEntry) result += ","; firstEntry = false;
+                        result += jsonStr(label) + ":" + runSearch(itemTags, itemQ);
+                    }
                 }
-                body += "]}";
+                result += "}";
+                return toolOk(result);
             }
-            body += "]";
-            return toolOk(body);
+
+            // Single-search mode (backwards-compatible)
+            return toolOk(runSearch(parseJsonString(args, "tags"), parseJsonString(args, "q")));
         }
 
         if (name == "vcvrack_get_plugin") {
@@ -1371,7 +1415,7 @@ void RackHttpServer::setupRoutes() {
                 app::ModuleWidget* mw = model->createModuleWidget(m); if (!mw) { delete m; return; }
                 math::Vec pos;
                 if (x >= 0.f) {
-                    if (y < 0.f) { failReason = "y is required when x is provided"; delete mw; delete m; return; }
+                    if (y < 0.f) { failReason = "y is required when x is provided"; mw->module = nullptr; delete mw; delete m; return; }
                     pos = math::Vec(x, y);
                 } else {
                     pos = computeAutoPosition(nearId, mw->box.size.x);
@@ -1382,12 +1426,14 @@ void RackHttpServer::setupRoutes() {
                 int rowIdx = roundRowIndex(pos.y);
                 if (pos.x < 0.f || pos.y < 0.f) {
                     failReason = "No valid matrix slot available for auto-placement";
+                    mw->module = nullptr; // detach before delete so ~ModuleWidget() doesn't call engine->removeModule on unregistered module
                     delete mw;
                     delete m;
                     return;
                 }
                 if (!isWithinRowBounds(rowIdx, mcpRowIdx, prefs) || !isWithinColBounds(pos.x, mw->box.size.x, mcpX, prefs)) {
                     failReason = "Requested placement is outside matrix preferences";
+                    mw->module = nullptr; // detach before delete so ~ModuleWidget() doesn't call engine->removeModule on unregistered module
                     delete mw;
                     delete m;
                     return;
