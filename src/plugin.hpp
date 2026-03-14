@@ -1,7 +1,14 @@
 #pragma once
 #include <rack.hpp>
+#include <vector>
 
 using namespace rack;
+
+namespace rack {
+namespace plugin {
+extern std::vector<Plugin*> plugins;
+}
+}
 
 // Plugin instance is defined in plugin.cpp
 extern Plugin* pluginInstance;

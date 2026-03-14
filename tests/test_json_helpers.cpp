@@ -1,7 +1,7 @@
 /*
  * test_json_helpers.cpp
  *
- * Unit tests for the JSON builder/parser helpers used in RackMcpServer.cpp.
+ * Unit tests for the JSON builder/parser helpers used in src/RackMcpServer.cpp.
  * Compiled standalone — no VCV Rack SDK required.
  *
  * Build & run:
@@ -12,7 +12,7 @@
 #include <cstdio>
 #include <string>
 
-// ─── Copy of helpers under test (keep in sync with RackMcpServer.cpp) ───────
+// ─── Copy of helpers under test (keep in sync with src/RackMcpServer.cpp) ───
 
 static std::string jsonStr(const std::string& s) {
     std::string out = "\"";

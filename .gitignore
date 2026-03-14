@@ -27,3 +27,6 @@ CMakeUserPresets.json
 
 # Local AI assistant config
 .claude/
+.cache/
+patches/
+vcvrack-mcp-server.mcpb

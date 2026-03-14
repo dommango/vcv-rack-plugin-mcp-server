@@ -141,8 +141,8 @@ endif()
 
 # ── Plugin shared library ─────────────────────────────────────────────────────
 add_library(VCVRackMcpServer MODULE
-  plugin.cpp
-  RackMcpServer.cpp
+  src/plugin.cpp
+  src/RackMcpServer.cpp
 )
 
 set_target_properties(VCVRackMcpServer PROPERTIES
@@ -152,6 +152,7 @@ set_target_properties(VCVRackMcpServer PROPERTIES
 )
 
 target_include_directories(VCVRackMcpServer PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${RACK_INCLUDE_DIR}
   ${RACK_DEP_DIR}
   ${HTTPLIB_INCLUDE_DIR}

@@ -75,7 +75,7 @@ Pass `-DRACK_DIR=/path/to/Rack-SDK` to use an existing SDK.
 
 ```bash
 # Terminal 1 — rebuild + reinstall on every save
-find . -name "*.cpp" -o -name "*.hpp" | entr -c make install
+find src -name "*.cpp" -o -name "*.hpp" | entr -c make install
 
 # Terminal 2 — relaunch Rack after each build (macOS)
 pkill -x "Rack" ; sleep 0.5 ; open -a "VCV Rack 2 Free"
@@ -154,21 +154,22 @@ curl -s -X POST $BASE/patch/save \
 
 ## 5. Test the MCP server
 
-Run the Python MCP server pointing at Rack:
-
-```bash
-RACK_PORT=2600 python vcv_rack_mcp_server.py
-```
+The MCP server is now embedded directly in the C++ plugin and exposed over HTTP. There is no longer a separate Python wrapper.
 
 ### Interactive inspector (recommended)
 
+You can use the MCP Inspector to test the tools manually:
+
 ```bash
+# Install the MCP CLI
 pip install "mcp[cli]"
-mcp dev vcv_rack_mcp_server.py
+
+# Start the inspector pointing at the Rack MCP endpoint
+# (Requires Rack to be running with the module enabled)
+mcp dev http://127.0.0.1:2600/mcp
 ```
 
-Opens a browser UI at `http://localhost:5173` — call every tool manually and
-see the exact JSON exchanged, without wiring up Claude.
+This opens a browser UI where you can call every tool (e.g., `vcvrack_get_status`, `vcvrack_add_module`) and see the exact JSON exchanged.
 
 ### Test with Claude Desktop
 
@@ -178,9 +179,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
 {
   "mcpServers": {
     "vcvrack": {
-      "command": "python",
-      "args": ["/absolute/path/to/vcv_rack_mcp_server.py"],
-      "env": { "RACK_PORT": "2600" }
+      "type": "http",
+      "url": "http://127.0.0.1:2600/mcp"
     }
   }
 }
@@ -227,6 +227,9 @@ python3 -c "import json; json.load(open('plugin.json')); print('plugin.json OK')
 
 # Quick HTTP smoke test (Rack must be running with module enabled)
 curl -sf http://127.0.0.1:2600/status | python3 -m json.tool
+
+# Run integration tests
+python3 tests/test_server.py
 ```
 
 ---
@@ -242,5 +245,5 @@ curl -sf http://127.0.0.1:2600/status | python3 -m json.tool
 | CMake configure | `cmake -B build` |
 | CMake build + install | `cmake --build build && cmake --install build` |
 | Test HTTP | `curl -s http://127.0.0.1:2600/status \| jq .` |
-| Inspect MCP tools | `mcp dev vcv_rack_mcp_server.py` |
+| Inspect MCP tools | `mcp dev http://127.0.0.1:2600/mcp` |
 | Watch Rack log | `tail -f ~/Documents/Rack2/log.txt` |

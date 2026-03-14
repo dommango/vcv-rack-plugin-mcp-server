@@ -7,21 +7,30 @@ Usage:
 
 Commands:
   status                              Server status and patch info
+  mcp-position                        MCP Server module root position
   sample-rate                         Engine sample rate
+  layout                              Rack spatial map — call before every add
   library [plugin_slug]               List installed plugins/modules
   modules                             List modules in current patch
   module <id>                         Detail for one module
-  add <plugin_slug> <module_slug> [x y]  Add a module
+  add <plugin_slug> <module_slug> <x> <y>  Add a module at explicit position
   remove <id>                         Remove a module
   params <id>                         Get parameter metadata and current raw values for a module
   set-param <id> <param_id> <value> [<param_id> <value> ...]  Set params (prefer small batches after inspecting params)
   cables                              List all cables
   connect <out_mod_id> <out_port_id> <in_mod_id> <in_port_id>  Connect ports
   disconnect <cable_id>               Remove a cable
-  save <path>                         Save current patch
-  load <path>                         Load a patch
+  layout-prefs                        Get matrix layout preferences
+  set-layout-prefs <cols_hp> <rows>   Set matrix layout preferences (0 = unbounded)
 
 Notes:
+  - Always call `layout` before adding modules. Use the returned `suggested_positions`
+    to pick explicit x y coordinates for each `add`. Never rely on auto-placement.
+  - Prefer `append_mcp_row` for modules that belong with the main patch section.
+    If the row already ends with `Audio 2`/other output modules, prefer
+    `insert_before_output` so outputs remain at the far right.
+  - When adding several modules in a row, compute the next x as: x + width (returned
+    by each `add` response) — no need to call `layout` again between each add.
   - Always run `params <id>` before `set-param` so you can use the module's real
     min/max range, displayValue, and options instead of guessing from the name.
   - Many Rack controls use normalized raw values rather than literal Hz/seconds.
@@ -59,6 +68,47 @@ def pretty(obj):
     print(json.dumps(obj, indent=2))
 
 
+def run_mcp_server(port):
+    """
+    stdio ↔ HTTP bridge for Claude Desktop.
+    Reads newline-delimited JSON-RPC from stdin, forwards each message to
+    POST http://127.0.0.1:<port>/mcp, and writes compact single-line JSON
+    responses back to stdout (NDJSON framing required by Claude Desktop).
+    """
+    url = f"http://127.0.0.1:{port}/mcp"
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+            # Notifications have no "id" — fire-and-forget, no response expected.
+            if "id" not in msg:
+                continue
+            payload = line.encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode("utf-8").strip()
+            if not body:
+                continue
+            compact = json.dumps(json.loads(body), separators=(",", ":"))
+            sys.stdout.write(compact + "\n")
+            sys.stdout.flush()
+        except urllib.error.URLError as e:
+            error = {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32603, "message": f"VCV Rack unreachable: {e}"},
+            }
+            sys.stdout.write(json.dumps(error, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="VCV Rack MCP Server CLI client",
@@ -66,9 +116,19 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("--port", type=int, default=2600, help="Server port (default: 2600)")
-    parser.add_argument("command", help="Command to run")
+    parser.add_argument("--mcp-server", action="store_true",
+                        help="Run as stdio MCP bridge for Claude Desktop")
+    parser.add_argument("command", nargs="?", help="Command to run")
     parser.add_argument("args", nargs="*", help="Command arguments")
     args = parser.parse_args()
+
+    if args.mcp_server:
+        run_mcp_server(args.port)
+        return
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
 
     base = f"http://127.0.0.1:{args.port}"
     cmd = args.command
@@ -80,6 +140,12 @@ def main():
 
     elif cmd == "sample-rate":
         pretty(request("GET", f"{base}/sample-rate"))
+
+    elif cmd == "mcp-position":
+        pretty(request("GET", f"{base}/mcp-module/position"))
+
+    elif cmd == "layout":
+        pretty(request("GET", f"{base}/rack/layout"))
 
     # ── Library ────────────────────────────────────────────────────────────
     elif cmd == "library":
@@ -98,12 +164,12 @@ def main():
         pretty(request("GET", f"{base}/modules/{a[0]}"))
 
     elif cmd == "add":
-        if len(a) < 2:
-            parser.error("add requires <plugin_slug> <module_slug> [x y]")
-        body = {"plugin": a[0], "slug": a[1]}
-        if len(a) >= 4:
-            body["x"] = float(a[2])
-            body["y"] = float(a[3])
+        if len(a) < 4:
+            parser.error(
+                "add requires <plugin_slug> <module_slug> <x> <y>\n"
+                "  Run `layout` first to get the correct x y coordinates."
+            )
+        body = {"plugin": a[0], "slug": a[1], "x": float(a[2]), "y": float(a[3])}
         pretty(request("POST", f"{base}/modules/add", body))
 
     elif cmd == "remove":
@@ -145,16 +211,15 @@ def main():
             parser.error("disconnect requires <cable_id>")
         pretty(request("DELETE", f"{base}/cables/{a[0]}"))
 
-    # ── Patch ──────────────────────────────────────────────────────────────
-    elif cmd == "save":
-        if not a:
-            parser.error("save requires <path>")
-        pretty(request("POST", f"{base}/patch/save", {"path": a[0]}))
+    # ── Layout preferences ─────────────────────────────────────────────────
+    elif cmd == "layout-prefs":
+        pretty(request("GET", f"{base}/layout/preferences"))
 
-    elif cmd == "load":
-        if not a:
-            parser.error("load requires <path>")
-        pretty(request("POST", f"{base}/patch/load", {"path": a[0]}))
+    elif cmd == "set-layout-prefs":
+        if len(a) < 2:
+            parser.error("set-layout-prefs requires <cols_hp> <rows>")
+        body = {"matrix_cols_hp": int(a[0]), "matrix_rows": int(a[1])}
+        pretty(request("POST", f"{base}/layout/preferences", body))
 
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
