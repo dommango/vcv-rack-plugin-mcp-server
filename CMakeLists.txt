@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(VCVRackMcpServer VERSION 2.1.0 LANGUAGES CXX)
+project(VCVRackMcpServer VERSION 2.1.1 LANGUAGES CXX)
 # NOTE: The major version MUST be 2 — VCV Rack 2 rejects plugins whose
 # version does not start with "2." (ABI compatibility check).
 # Use minor.patch for your own versioning: 2.<minor>.<patch>
