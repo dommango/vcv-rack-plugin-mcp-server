@@ -132,18 +132,13 @@ python3 skills/vcvrack_client.py connect <vco_id> 0 <audio_id> 0
 python3 skills/vcvrack_client.py connect <vco_id> 0 <audio_id> 1
 ```
 
-After the patch is working, save it:
-
-```bash
-python3 skills/vcvrack_client.py save ~/Documents/Rack2/patches/first-test.vcv
-```
 
 ## How to work with this plugin
 
 A reliable workflow is:
 
 ```text
-Start Rack -> add MCP Server -> turn it on -> verify /status -> connect your AI client -> search library -> add modules -> inspect module IDs and params -> connect cables -> save patch
+Start Rack -> add MCP Server -> turn it on -> verify /status -> connect your AI client -> search library -> add modules -> inspect module IDs and params -> connect cables
 ```
 
 Two practical rules matter a lot for AI-driven patch building:
@@ -208,14 +203,6 @@ Important notes for parameter automation:
 - Prefer small `POST /modules/:id/params` batches, then read the params again to confirm the change before continuing.
 - If a write times out, first confirm Rack is responsive and the `MCP Server` module is still enabled, then retry with a smaller step.
 
-### 5. Save your patch
-
-```bash
-curl -s -X POST http://127.0.0.1:2600/patch/save \
-  -H "Content-Type: application/json" \
-  -d '{"path":"/tmp/my-patch.vcv"}' | python3 -m json.tool
-```
-
 ## Use with MCP clients
 
 ### Claude Desktop
@@ -245,7 +232,6 @@ Example prompts:
 - `Search the installed Rack library for oscillators and add a good starting VCO.`
 - `Build a simple subtractive synth with VCO, VCF, VCA, ADSR, and Audio.`
 - `Build a simple ambient drone. Inspect each module's params before setting them, and treat displayed param values as authoritative instead of guessing in Hz.`
-- `Save the current patch to ~/Documents/Rack2/patches/test.vcv`.
 
 ## Troubleshooting MCP timeouts
 
@@ -304,8 +290,6 @@ Common commands:
 | `cables` | `python3 skills/vcvrack_client.py cables` | List cable connections |
 | `connect <outMod> <outPort> <inMod> <inPort>` | `python3 skills/vcvrack_client.py connect 1 0 2 0` | Create a cable |
 | `disconnect <cableId>` | `python3 skills/vcvrack_client.py disconnect 7` | Remove a cable |
-| `save <path>` | `python3 skills/vcvrack_client.py save /tmp/test.vcv` | Save patch |
-| `load <path>` | `python3 skills/vcvrack_client.py load /tmp/test.vcv` | Load patch |
 
 Ready-made walkthroughs live in `skills/examples/`.
 
@@ -336,8 +320,6 @@ All responses use one of these envelopes:
 | `GET` | `/sample-rate` | - | Return sample rate |
 | `GET` | `/library` | `?q=&tags=` | Search installed plugins/modules |
 | `GET` | `/library/:plugin` | - | List one plugin's modules |
-| `POST` | `/patch/save` | `{path}` | Save patch |
-| `POST` | `/patch/load` | `{path}` | Load patch |
 | `POST` | `/mcp` | JSON-RPC body | MCP endpoint |
 | `GET` | `/mcp` | - | SSE stream |
 

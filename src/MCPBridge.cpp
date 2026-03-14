@@ -26,8 +26,6 @@
  *  DELETE /cables/:id        — disconnect a cable
  *  GET  /library             — list ALL installed plugins + their modules (for AI discovery)
  *  GET  /library/:plugin     — list modules in a specific plugin
- *  POST /patch/save          — save current patch to a path { path }
- *  POST /patch/load          — load patch from a path { path }
  *  GET  /sample-rate         — get engine sample rate
  */
 
@@ -553,23 +551,6 @@ void RackHttpServer::setupRoutes() {
             res.set_content(err("Plugin not found: " + pluginSlug), "application/json");
         });
 
-        // ── POST /patch/save ─────────────────────────────────────────────
-        // Body: { "path": "/home/user/mypatch.vcv" }
-        svr.Post("/patch/save", [](const httplib::Request& req, httplib::Response& res) {
-            std::string path = parseJsonString(req.body, "path");
-            if (path.empty()) { res.status = 400; res.set_content(err("Missing 'path'"), "application/json"); return; }
-            APP->patch->saveAs(path);
-            res.set_content(ok("{" + jsonKVs("saved", path, true) + "}"), "application/json");
-        });
-
-        // ── POST /patch/load ─────────────────────────────────────────────
-        // Body: { "path": "/home/user/mypatch.vcv" }
-        svr.Post("/patch/load", [](const httplib::Request& req, httplib::Response& res) {
-            std::string path = parseJsonString(req.body, "path");
-            if (path.empty()) { res.status = 400; res.set_content(err("Missing 'path'"), "application/json"); return; }
-            APP->patch->load(path);
-            res.set_content(ok("{" + jsonKVs("loaded", path, true) + "}"), "application/json");
-        });
 }
 
 void RackHttpServer::start() {
