@@ -206,16 +206,15 @@ jobs:
           msystem: MINGW64
           update: false
           install: >-
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
             zip
             jq
 
-      - name: Install GCC 14 (Rack SDK incompatible with GCC 15)
+      - name: Install GCC 14 + build tools (Rack SDK incompatible with GCC 15)
         run: |
-          curl -LO https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-14.2.0-3-any.pkg.tar.zst
           curl -LO https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-libs-14.2.0-3-any.pkg.tar.zst
-          pacman -U --noconfirm mingw-w64-x86_64-gcc-14.2.0-3-any.pkg.tar.zst mingw-w64-x86_64-gcc-libs-14.2.0-3-any.pkg.tar.zst
+          curl -LO https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-14.2.0-3-any.pkg.tar.zst
+          pacman -U --noconfirm --nodeps --nodeps mingw-w64-x86_64-gcc-libs-14.2.0-3-any.pkg.tar.zst mingw-w64-x86_64-gcc-14.2.0-3-any.pkg.tar.zst
+          pacman -S --noconfirm --needed mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja
           g++ --version
 
       - name: Cache Rack SDK (win-x64)
