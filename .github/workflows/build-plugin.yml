@@ -137,7 +137,7 @@ jobs:
     name: Collect release artifacts
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    needs: [build-linux, build-mac]
+    needs: [build-linux, build-mac, build-windows]
     steps:
       - uses: actions/checkout@v4
 
@@ -183,55 +183,59 @@ jobs:
           name: release-bundles
           path: _release/*.zip
 
-# # =============================================================================
-# # Job 5 — Build Windows x64 (native runner, CMake + MSYS2/MinGW)
-# # =============================================================================
-#   build-windows:
-#     name: Build (win-x64)
-#     needs: modify-plugin-version
-#     runs-on: windows-latest
-#     defaults:
-#       run:
-#         shell: msys2 {0}
-#     steps:
-#       - uses: actions/checkout@v4
+# =============================================================================
+# Job 5 — Build Windows x64 (native runner, CMake + MSYS2/MinGW)
+# =============================================================================
+  build-windows:
+    name: Build (win-x64)
+    needs: modify-plugin-version
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
 
-#       - uses: actions/cache@v4
-#         with:
-#           path: plugin.json
-#           key: ${{ github.sha }}-${{ github.run_id }}
+      - uses: actions/cache@v4
+        with:
+          path: plugin.json
+          key: ${{ github.sha }}-${{ github.run_id }}
 
-#       - uses: msys2/setup-msys2@v2
-#         with:
-#           msystem: MINGW64
-#           update: true
-#           install: >-
-#             mingw-w64-x86_64-cmake
-#             mingw-w64-x86_64-gcc
-#             mingw-w64-x86_64-ninja
-#             zip
-#             jq
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-ninja
+            zip
+            jq
 
-#       - name: Cache Rack SDK (win-x64)
-#         uses: actions/cache@v4
-#         with:
-#           path: build/_deps/rack-sdk
-#           key: rack-sdk-win-x64-${{ hashFiles('CMakeLists.txt') }}
+      - name: Cache Rack SDK (win-x64)
+        uses: actions/cache@v4
+        with:
+          path: build/_deps/rack-sdk
+          key: rack-sdk-win-x64-${{ hashFiles('CMakeLists.txt') }}
 
-#       - name: Configure + build
-#         run: |
-#           cmake -B build \
-#             -G "Ninja" \
-#             -DCMAKE_BUILD_TYPE=Release
-#           cmake --build build --parallel
+      - name: Configure + build
+        run: |
+          cmake -B build \
+            -G "Ninja" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
 
-#       - name: Package .zip bundle
-#         run: make dist BUILD_DIR=build
+      - name: Stage build output
+        run: |
+          mkdir -p _stage/VCVRackMcpServer/res
+          cp build/plugin.dll _stage/VCVRackMcpServer/
+          cp build/plugin.json _stage/VCVRackMcpServer/plugin.json
+          cp -R res/. _stage/VCVRackMcpServer/res/
 
-#       - uses: actions/upload-artifact@v4
-#         with:
-#           name: win-x64
-#           path: dist/*.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stage-win-x64
+          path: _stage/VCVRackMcpServer
 
 # =============================================================================
 # Job 6 — Publish GitHub Release (only on version tags like v2.0.0)
@@ -278,6 +282,12 @@ jobs:
                - `~/Library/Application Support/Rack2/plugins-mac-arm64/` on Apple Silicon
                - `~/Library/Application Support/Rack2/plugins-mac-x64/` on Intel Macs
             4. Restart VCV Rack.
+
+            ### Install on Windows
+            1. Download `*-win-x64.zip`.
+            2. Unzip it. This creates a `VCVRackMcpServer` folder.
+            3. Move `VCVRackMcpServer` into `%APPDATA%\Rack2\plugins\`.
+            4. Restart VCV Rack and add the `MCP Server` module from the module browser.
 
             ### Install on Linux
             1. Download `*-lin-x64.zip`.
