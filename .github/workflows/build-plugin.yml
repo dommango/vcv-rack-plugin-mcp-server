@@ -222,7 +222,8 @@ jobs:
         run: |
           cmake -B build \
             -G "Ninja" \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-mno-xop"
           cmake --build build --parallel
 
       - name: Stage build output
