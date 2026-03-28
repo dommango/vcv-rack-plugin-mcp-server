@@ -170,9 +170,7 @@ target_compile_options(VCVRackMcpServer PRIVATE
 if(RACK_ARCH STREQUAL "lin-x64")
   target_compile_options(VCVRackMcpServer PRIVATE -march=nocona)
 elseif(RACK_ARCH STREQUAL "win-x64")
-  # Use SSE2-only baseline on Windows/MinGW to avoid SIMDE vs native intrinsic
-  # redefinition conflicts. SIMDE handles SSSE3+ portably.
-  target_compile_options(VCVRackMcpServer PRIVATE -march=x86-64 -msse2)
+  target_compile_options(VCVRackMcpServer PRIVATE -march=nehalem)
 elseif(RACK_ARCH STREQUAL "mac-x64")
   target_compile_options(VCVRackMcpServer PRIVATE -march=nehalem)  # SSE4.2 for Intel Mac
 endif()

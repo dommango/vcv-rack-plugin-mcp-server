@@ -212,13 +212,13 @@ jobs:
             zip
             jq
 
-      - name: Downgrade to GCC 14 (Rack SDK incompatible with GCC 15)
+      - name: Downgrade to GCC 13 (Rack SDK SIMDE incompatible with GCC 14+)
         run: |
-          curl -LO https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-libs-14.2.0-3-any.pkg.tar.zst
-          curl -LO https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-14.2.0-3-any.pkg.tar.zst
+          curl -LO https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-libs-13.3.0-2-any.pkg.tar.zst
+          curl -LO https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-13.3.0-2-any.pkg.tar.zst
           pacman -U --noconfirm --nodeps --nodeps \
-            mingw-w64-x86_64-gcc-libs-14.2.0-3-any.pkg.tar.zst \
-            mingw-w64-x86_64-gcc-14.2.0-3-any.pkg.tar.zst
+            mingw-w64-x86_64-gcc-libs-13.3.0-2-any.pkg.tar.zst \
+            mingw-w64-x86_64-gcc-13.3.0-2-any.pkg.tar.zst
           g++ --version
 
       - name: Cache Rack SDK (win-x64)
