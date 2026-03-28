@@ -232,7 +232,7 @@ jobs:
           cmake -B build \
             -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-D_USE_MATH_DEFINES -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-popcnt"
+            -DCMAKE_CXX_FLAGS="-D_USE_MATH_DEFINES"
           cmake --build build --parallel
 
       - name: Stage build output
