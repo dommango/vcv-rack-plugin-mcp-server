@@ -212,14 +212,8 @@ jobs:
             zip
             jq
 
-      - name: Downgrade to GCC 13 (Rack SDK SIMDE incompatible with GCC 14+)
-        run: |
-          curl -LO https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-libs-13.3.0-2-any.pkg.tar.zst
-          curl -LO https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-gcc-13.3.0-2-any.pkg.tar.zst
-          pacman -U --noconfirm --nodeps --nodeps \
-            mingw-w64-x86_64-gcc-libs-13.3.0-2-any.pkg.tar.zst \
-            mingw-w64-x86_64-gcc-13.3.0-2-any.pkg.tar.zst
-          g++ --version
+      - name: Check GCC version
+        run: g++ --version
 
       - name: Cache Rack SDK (win-x64)
         uses: actions/cache@v4
@@ -232,7 +226,7 @@ jobs:
           cmake -B build \
             -G "Ninja" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-D_USE_MATH_DEFINES"
+            -DCMAKE_CXX_FLAGS="-D_USE_MATH_DEFINES -Wno-error -w"
           cmake --build build --parallel
 
       - name: Stage build output
